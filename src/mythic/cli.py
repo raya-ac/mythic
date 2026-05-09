@@ -10,6 +10,7 @@ from mythic import __version__
 from mythic.bridge import EngramMemoryBridge, NullMemoryBridge
 from mythic.memory import EngramMemoryAdapter, NullMemoryAdapter
 from mythic.planner import TaskStatus
+from mythic.reinforcement import ActivationOutcome
 from mythic.runtime import MythicRuntime
 from mythic.store import make_runtime_store
 
@@ -128,6 +129,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_reflections_list.add_argument("--session-id")
     p_reflections_list.add_argument("--limit", type=int, default=20)
 
+    p_reinforcement = sub.add_parser("reinforcement", parents=[store_parent], help="Inspect and update memory reinforcement")
+    reinforcement_sub = p_reinforcement.add_subparsers(dest="reinforcement_command")
+
+    p_reinforce_feedback = reinforcement_sub.add_parser("feedback", parents=[store_parent], help="Record feedback for an activated memory")
+    p_reinforce_feedback.add_argument("session_id")
+    p_reinforce_feedback.add_argument("memory_id")
+    p_reinforce_feedback.add_argument("outcome", choices=[outcome.value for outcome in ActivationOutcome])
+    p_reinforce_feedback.add_argument("--cycle-id")
+    p_reinforce_feedback.add_argument("--note")
+    p_reinforce_feedback.add_argument("--source", default="human")
+    p_reinforce_feedback.add_argument("--signal", type=float)
+
+    p_reinforce_feedback_list = reinforcement_sub.add_parser("feedback-list", parents=[store_parent], help="List activation feedback")
+    p_reinforce_feedback_list.add_argument("--session-id")
+    p_reinforce_feedback_list.add_argument("--memory-id")
+    p_reinforce_feedback_list.add_argument("--limit", type=int, default=50)
+
+    p_reinforce_list = reinforcement_sub.add_parser("list", parents=[store_parent], help="List reinforcement states")
+    p_reinforce_list.add_argument("--limit", type=int, default=50)
+
+    p_reinforce_decay = reinforcement_sub.add_parser("decay", parents=[store_parent], help="Decay reinforcement scores toward zero")
+    p_reinforce_decay.add_argument("--rate", type=float, default=0.05)
+
     p_plugin = sub.add_parser("plugin", parents=[store_parent], help="Run supervised plugins")
     plugin_sub = p_plugin.add_subparsers(dest="plugin_command")
     p_plugin_list = plugin_sub.add_parser("list", parents=[store_parent], help="Discover plugins under a root")
@@ -231,6 +255,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "reflections" and args.reflections_command == "list":
         reflections = runtime.list_reflections(limit=args.limit, session_id=args.session_id)
         print(json.dumps([reflection.to_dict() for reflection in reflections], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "reinforcement" and args.reinforcement_command == "feedback":
+        step = runtime.record_feedback(
+            session_id=args.session_id,
+            memory_id=args.memory_id,
+            outcome=args.outcome,
+            cycle_id=args.cycle_id,
+            note=args.note,
+            source=args.source,
+            signal=args.signal,
+        )
+        print(
+            json.dumps(
+                {
+                    "feedback": step.feedback.to_dict(),
+                    "reinforcement": step.state.to_dict(),
+                    "event": step.event.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "reinforcement" and args.reinforcement_command == "feedback-list":
+        feedback = runtime.list_feedback(
+            limit=args.limit,
+            memory_id=args.memory_id,
+            session_id=args.session_id,
+        )
+        print(json.dumps([item.to_dict() for item in feedback], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "reinforcement" and args.reinforcement_command == "list":
+        states = runtime.list_reinforcements(limit=args.limit)
+        print(json.dumps([state.to_dict() for state in states], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "reinforcement" and args.reinforcement_command == "decay":
+        step = runtime.decay_reinforcements(rate=args.rate)
+        print(
+            json.dumps(
+                {
+                    "count": len(step.states),
+                    "states": [state.to_dict() for state in step.states],
+                    "event": step.event.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "plugin" and args.plugin_command == "run":

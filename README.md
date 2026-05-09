@@ -18,6 +18,7 @@ This repo is at the first runnable runtime layer:
 - event bus for structured cognition events with persisted event logs
 - cognitive cycles that combine planner state, memory activation, and reflection
 - planner-aware memory activation request model
+- adaptive memory reinforcement from activation feedback and decay
 - reflective records for blocked/failed tasks and plugin failures
 - resumable session snapshots
 - supervised plugin runner with manifest-based capability discovery
@@ -78,6 +79,22 @@ mythic session cycle "$SESSION_ID" \
 Cycle summaries are written as episodic narrative memories. Reflections are
 written as procedural memories with `metadata.kind = mythic_reflection`, because
 Engram does not currently expose a separate reflective layer.
+
+Activated memories can be reinforced or penalized after a cycle:
+
+```bash
+mythic reinforcement feedback "$SESSION_ID" "$MEMORY_ID" useful \
+  --cycle-id "$CYCLE_ID" \
+  --note "helped choose the next task"
+mythic reinforcement list
+mythic reinforcement feedback-list --memory-id "$MEMORY_ID"
+mythic reinforcement decay --rate 0.05
+```
+
+Reinforcement state is stored locally in the runtime database. Future activations
+for the same memory carry `metadata.reinforcement` and receive an adjusted
+`planner_relevance`, so repeatedly useful memory becomes more likely to shape
+planning while contradicted or stale memory is down-weighted.
 
 Plugins are manifest-driven and run under basic supervision:
 

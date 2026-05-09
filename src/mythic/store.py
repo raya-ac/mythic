@@ -9,6 +9,7 @@ from typing import Protocol
 
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.events import CognitionEvent
+from mythic.reinforcement import ActivationFeedback, ReinforcementState
 from mythic.session import CognitiveSession
 
 
@@ -52,6 +53,22 @@ class RuntimeStore(Protocol):
         session_id: str | None = None,
     ) -> list[ReflectionRecord]: ...
 
+    def save_feedback(self, feedback: ActivationFeedback) -> None: ...
+
+    def list_feedback(
+        self,
+        *,
+        limit: int = 50,
+        memory_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[ActivationFeedback]: ...
+
+    def load_reinforcement(self, memory_id: str) -> ReinforcementState | None: ...
+
+    def save_reinforcement(self, state: ReinforcementState) -> None: ...
+
+    def list_reinforcements(self, *, limit: int = 50) -> list[ReinforcementState]: ...
+
 
 class JsonRuntimeStore:
     """Small transparent persistence backend for debugging runtime state."""
@@ -62,6 +79,8 @@ class JsonRuntimeStore:
         self.events_path = self.root / "events.jsonl"
         self.cycles_path = self.root / "cycles.jsonl"
         self.reflections_path = self.root / "reflections.jsonl"
+        self.feedback_path = self.root / "activation_feedback.jsonl"
+        self.reinforcement_path = self.root / "reinforcement.json"
 
     def init(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -161,6 +180,66 @@ class JsonRuntimeStore:
             reflections = reflections[-limit:]
         return reflections
 
+    def save_feedback(self, feedback: ActivationFeedback) -> None:
+        self.init()
+        with self.feedback_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(feedback.to_dict(), sort_keys=True) + "\n")
+
+    def list_feedback(
+        self,
+        *,
+        limit: int = 50,
+        memory_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[ActivationFeedback]:
+        self.init()
+        if not self.feedback_path.exists():
+            return []
+        feedback = [
+            ActivationFeedback.from_dict(json.loads(line))
+            for line in self.feedback_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if memory_id is not None:
+            feedback = [item for item in feedback if item.memory_id == memory_id]
+        if session_id is not None:
+            feedback = [item for item in feedback if item.session_id == session_id]
+        if limit > 0:
+            feedback = feedback[-limit:]
+        return feedback
+
+    def _reinforcement_payload(self) -> dict[str, dict]:
+        if not self.reinforcement_path.exists():
+            return {}
+        return json.loads(self.reinforcement_path.read_text(encoding="utf-8"))
+
+    def load_reinforcement(self, memory_id: str) -> ReinforcementState | None:
+        self.init()
+        payload = self._reinforcement_payload().get(memory_id)
+        if payload is None:
+            return None
+        return ReinforcementState.from_dict(payload)
+
+    def save_reinforcement(self, state: ReinforcementState) -> None:
+        self.init()
+        payload = self._reinforcement_payload()
+        payload[state.memory_id] = state.to_dict()
+        self.reinforcement_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def list_reinforcements(self, *, limit: int = 50) -> list[ReinforcementState]:
+        self.init()
+        states = [
+            ReinforcementState.from_dict(item)
+            for item in self._reinforcement_payload().values()
+        ]
+        states = sorted(states, key=lambda state: state.updated_at, reverse=True)
+        if limit > 0:
+            states = states[:limit]
+        return states
+
 
 class SQLiteRuntimeStore:
     """SQLite-backed local-first persistence for sessions and cognition events."""
@@ -234,6 +313,38 @@ class SQLiteRuntimeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_reflections_session
                 ON reflections(session_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS activation_feedback (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                cycle_id TEXT,
+                memory_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                signal REAL NOT NULL,
+                note TEXT,
+                source TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_activation_feedback_memory
+                ON activation_feedback(memory_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_activation_feedback_session
+                ON activation_feedback(session_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS reinforcement_state (
+                memory_id TEXT PRIMARY KEY,
+                score REAL NOT NULL,
+                uses INTEGER NOT NULL,
+                successes INTEGER NOT NULL,
+                failures INTEGER NOT NULL,
+                contradictions INTEGER NOT NULL,
+                stale INTEGER NOT NULL,
+                last_outcome TEXT,
+                updated_at REAL NOT NULL,
+                decayed_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reinforcement_updated
+                ON reinforcement_state(updated_at DESC);
             """
         )
         self.conn.commit()
@@ -469,6 +580,150 @@ class SQLiteRuntimeStore:
             )
             for row in rows
         ]
+
+    def save_feedback(self, feedback: ActivationFeedback) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO activation_feedback
+            (id, session_id, cycle_id, memory_id, outcome, signal, note, source, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                feedback.id,
+                feedback.session_id,
+                feedback.cycle_id,
+                feedback.memory_id,
+                feedback.outcome.value,
+                feedback.signal,
+                feedback.note,
+                feedback.source,
+                json.dumps(feedback.metadata, sort_keys=True),
+                feedback.created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_feedback(
+        self,
+        *,
+        limit: int = 50,
+        memory_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[ActivationFeedback]:
+        self.init()
+        params: list[object] = []
+        filters: list[str] = []
+        if memory_id is not None:
+            filters.append("memory_id = ?")
+            params.append(memory_id)
+        if session_id is not None:
+            filters.append("session_id = ?")
+            params.append(session_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM activation_feedback
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            rows = list(reversed(rows))
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM activation_feedback
+                {where}
+                ORDER BY created_at ASC
+                """,
+                params,
+            ).fetchall()
+
+        return [
+            ActivationFeedback.from_dict(
+                {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "cycle_id": row["cycle_id"],
+                    "memory_id": row["memory_id"],
+                    "outcome": row["outcome"],
+                    "signal": row["signal"],
+                    "note": row["note"],
+                    "source": row["source"],
+                    "metadata": json.loads(row["metadata"]),
+                    "created_at": row["created_at"],
+                }
+            )
+            for row in rows
+        ]
+
+    def load_reinforcement(self, memory_id: str) -> ReinforcementState | None:
+        self.init()
+        row = self.conn.execute(
+            "SELECT * FROM reinforcement_state WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ReinforcementState.from_dict(dict(row))
+
+    def save_reinforcement(self, state: ReinforcementState) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT INTO reinforcement_state
+            (memory_id, score, uses, successes, failures, contradictions, stale, last_outcome, updated_at, decayed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                score = excluded.score,
+                uses = excluded.uses,
+                successes = excluded.successes,
+                failures = excluded.failures,
+                contradictions = excluded.contradictions,
+                stale = excluded.stale,
+                last_outcome = excluded.last_outcome,
+                updated_at = excluded.updated_at,
+                decayed_at = excluded.decayed_at
+            """,
+            (
+                state.memory_id,
+                state.score,
+                state.uses,
+                state.successes,
+                state.failures,
+                state.contradictions,
+                state.stale,
+                state.last_outcome.value if state.last_outcome is not None else None,
+                state.updated_at,
+                state.decayed_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_reinforcements(self, *, limit: int = 50) -> list[ReinforcementState]:
+        self.init()
+        if limit > 0:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM reinforcement_state
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM reinforcement_state
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        return [ReinforcementState.from_dict(dict(row)) for row in rows]
 
     def close(self) -> None:
         if self._conn is not None:

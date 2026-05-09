@@ -11,6 +11,7 @@ from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryActivationRequest, MemoryAdapter, NullMemoryAdapter
 from mythic.planner import TaskNode, TaskStatus
 from mythic.plugins import PluginHost, PluginResult
+from mythic.reinforcement import ActivationFeedback, ActivationOutcome, ReinforcementState, apply_feedback, decay_state
 from mythic.session import CognitiveSession
 from mythic.store import RuntimeStore, SQLiteRuntimeStore
 
@@ -39,6 +40,23 @@ class CycleStep:
     cycle: CognitiveCycle
     events: list[CognitionEvent]
     bridge_result: BridgePublishResult | None = None
+
+
+@dataclass
+class FeedbackStep:
+    """Result of recording feedback for one activated memory."""
+
+    feedback: ActivationFeedback
+    state: ReinforcementState
+    event: CognitionEvent
+
+
+@dataclass
+class DecayStep:
+    """Result of decaying all reinforcement states."""
+
+    states: list[ReinforcementState]
+    event: CognitionEvent
 
 
 class MythicRuntime:
@@ -127,9 +145,36 @@ class MythicRuntime:
             previous_activation_ids=prior_activation_ids[-10:],
         )
 
+    def _apply_reinforcement(self, activations: list[MemoryActivation]) -> list[MemoryActivation]:
+        reinforced: list[MemoryActivation] = []
+        for activation in activations:
+            state = self.store.load_reinforcement(activation.memory_id)
+            if state is None:
+                reinforced.append(activation)
+                continue
+
+            adjusted_relevance = max(0.0, min(1.0, activation.planner_relevance + state.score))
+            metadata = dict(activation.metadata)
+            metadata["reinforcement"] = state.to_dict()
+            metadata["base_planner_relevance"] = activation.planner_relevance
+            metadata["reinforced_planner_relevance"] = adjusted_relevance
+            reinforced.append(
+                MemoryActivation(
+                    memory_id=activation.memory_id,
+                    score=activation.score,
+                    planner_relevance=adjusted_relevance,
+                    layer=activation.layer,
+                    content_preview=activation.content_preview,
+                    metadata=metadata,
+                )
+            )
+        return reinforced
+
     def activate_memory(self, session: CognitiveSession, *, top_k: int = 5) -> RuntimeStep:
         request = self._activation_request(session)
-        activations = self.memory_adapter.activate(request, top_k=top_k)
+        activations = self._apply_reinforcement(
+            self.memory_adapter.activate(request, top_k=top_k)
+        )
         session.activate_memories(activations)
         self.store.save_session(session)
 
@@ -220,7 +265,9 @@ class MythicRuntime:
             session_id=session.id,
         )
 
-        activations = self.memory_adapter.activate(request, top_k=top_k)
+        activations = self._apply_reinforcement(
+            self.memory_adapter.activate(request, top_k=top_k)
+        )
         session.activate_memories(activations)
 
         reflections = self._reflect_on_session(session, cycle_id=cycle.id)
@@ -289,6 +336,55 @@ class MythicRuntime:
             )
 
         return CycleStep(session=session, cycle=completed_cycle, events=events, bridge_result=bridge_result)
+
+    def record_feedback(
+        self,
+        *,
+        session_id: str,
+        memory_id: str,
+        outcome: ActivationOutcome | str,
+        cycle_id: str | None = None,
+        note: str | None = None,
+        source: str = "human",
+        signal: float | None = None,
+        metadata: dict | None = None,
+    ) -> FeedbackStep:
+        feedback = ActivationFeedback.create(
+            session_id=session_id,
+            memory_id=memory_id,
+            cycle_id=cycle_id,
+            outcome=outcome,
+            note=note,
+            source=source,
+            signal=signal,
+            metadata=metadata,
+        )
+        state = apply_feedback(self.store.load_reinforcement(memory_id), feedback)
+        self.store.save_feedback(feedback)
+        self.store.save_reinforcement(state)
+        event = self._emit(
+            "memory_reinforced",
+            {
+                "feedback": feedback.to_dict(),
+                "reinforcement": state.to_dict(),
+            },
+            session_id=session_id,
+        )
+        return FeedbackStep(feedback=feedback, state=state, event=event)
+
+    def decay_reinforcements(self, *, rate: float = 0.05) -> DecayStep:
+        bounded_rate = max(0.0, min(1.0, rate))
+        states = [
+            decay_state(state, rate=bounded_rate)
+            for state in self.store.list_reinforcements(limit=0)
+        ]
+        for state in states:
+            self.store.save_reinforcement(state)
+        event = self._emit(
+            "reinforcement_decay_completed",
+            {"rate": bounded_rate, "count": len(states)},
+        )
+        return DecayStep(states=states, event=event)
 
     def _reflect_on_session(self, session: CognitiveSession, *, cycle_id: str) -> list[ReflectionRecord]:
         reflections: list[ReflectionRecord] = []
@@ -444,6 +540,18 @@ class MythicRuntime:
     ) -> list[ReflectionRecord]:
         return self.store.list_reflections(limit=limit, session_id=session_id)
 
+    def list_feedback(
+        self,
+        *,
+        limit: int = 50,
+        memory_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[ActivationFeedback]:
+        return self.store.list_feedback(limit=limit, memory_id=memory_id, session_id=session_id)
+
+    def list_reinforcements(self, *, limit: int = 50) -> list[ReinforcementState]:
+        return self.store.list_reinforcements(limit=limit)
+
     def session_snapshot(self, session: CognitiveSession, *, limit: int = 10) -> dict:
         ready = [task.to_dict() for task in session.planner.ready_tasks()]
         active = [
@@ -494,4 +602,12 @@ class MythicRuntime:
             "suggested_next_actions": suggestions[:limit],
         }
 
-__all__ = ["CycleStep", "MemoryActivation", "MythicRuntime", "PluginRunStep", "RuntimeStep"]
+__all__ = [
+    "CycleStep",
+    "DecayStep",
+    "FeedbackStep",
+    "MemoryActivation",
+    "MythicRuntime",
+    "PluginRunStep",
+    "RuntimeStep",
+]

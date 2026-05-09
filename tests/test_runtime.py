@@ -183,6 +183,130 @@ def test_cycle_publish_uses_memory_bridge(tmp_path):
     assert step.events[-1].type == "bridge_publish_completed"
 
 
+def test_feedback_reinforces_future_activation(tmp_path):
+    runtime = MythicRuntime(
+        store=SQLiteRuntimeStore(tmp_path),
+        memory_adapter=StaticMemoryAdapter(),
+    )
+    session = runtime.start_session("reinforce memory").session
+    first_cycle = runtime.run_cycle(session)
+
+    feedback_step = runtime.record_feedback(
+        session_id=session.id,
+        cycle_id=first_cycle.cycle.id,
+        memory_id="mem_1",
+        outcome="useful",
+        note="helped choose the next task",
+    )
+    second_cycle = runtime.run_cycle(session)
+    activation = second_cycle.cycle.activations[0]
+
+    assert round(feedback_step.state.score, 3) == 0.15
+    assert feedback_step.event.type == "memory_reinforced"
+    assert activation.metadata["reinforcement"]["score"] == feedback_step.state.score
+    assert activation.metadata["base_planner_relevance"] == 0.8
+    assert round(activation.planner_relevance, 3) == 0.95
+
+
+def test_feedback_persists_and_negative_outcomes_reduce_relevance(tmp_path):
+    runtime = MythicRuntime(
+        store=SQLiteRuntimeStore(tmp_path),
+        memory_adapter=StaticMemoryAdapter(),
+    )
+    session = runtime.start_session("penalize stale memory").session
+
+    runtime.record_feedback(
+        session_id=session.id,
+        memory_id="mem_1",
+        outcome="contradicted",
+        note="project state had drifted",
+    )
+
+    reloaded = MythicRuntime(
+        store=SQLiteRuntimeStore(tmp_path),
+        memory_adapter=StaticMemoryAdapter(),
+    )
+    state = reloaded.list_reinforcements()[0]
+    feedback = reloaded.list_feedback(memory_id="mem_1")[0]
+    cycle = reloaded.run_cycle(reloaded.resume_session(session.id))
+
+    assert state.memory_id == "mem_1"
+    assert round(state.score, 3) == -0.25
+    assert state.failures == 1
+    assert state.contradictions == 1
+    assert feedback.outcome.value == "contradicted"
+    assert round(cycle.cycle.activations[0].planner_relevance, 3) == 0.55
+
+
+def test_decay_reinforcements_moves_scores_toward_zero(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("decay reinforcement").session
+    runtime.record_feedback(
+        session_id=session.id,
+        memory_id="mem_1",
+        outcome="useful",
+    )
+
+    step = runtime.decay_reinforcements(rate=0.5)
+
+    assert step.event.type == "reinforcement_decay_completed"
+    assert round(step.states[0].score, 3) == 0.075
+    assert runtime.list_reinforcements()[0].decayed_at is not None
+
+
+def test_json_store_persists_reinforcement_feedback(tmp_path):
+    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    session = runtime.start_session("json reinforcement").session
+
+    runtime.record_feedback(
+        session_id=session.id,
+        memory_id="mem_1",
+        outcome="stale",
+        note="old note",
+    )
+
+    reloaded = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    state = reloaded.list_reinforcements()[0]
+    feedback = reloaded.list_feedback(session_id=session.id)[0]
+
+    assert state.stale == 1
+    assert round(state.score, 3) == -0.12
+    assert feedback.note == "old note"
+
+
+def test_cli_reinforcement_commands(tmp_path, capsys):
+    store = tmp_path / "runtime"
+
+    assert main(["session", "start", "cli reinforcement smoke", "--store", str(store)]) == 0
+    session = json.loads(capsys.readouterr().out)
+
+    assert main([
+        "reinforcement",
+        "feedback",
+        session["id"],
+        "mem_1",
+        "useful",
+        "--store",
+        str(store),
+        "--note",
+        "cli signal",
+    ]) == 0
+    feedback_result = json.loads(capsys.readouterr().out)
+    assert feedback_result["reinforcement"]["successes"] == 1
+
+    assert main(["reinforcement", "list", "--store", str(store)]) == 0
+    states = json.loads(capsys.readouterr().out)
+    assert states[0]["memory_id"] == "mem_1"
+
+    assert main(["reinforcement", "feedback-list", "--store", str(store), "--memory-id", "mem_1"]) == 0
+    feedback = json.loads(capsys.readouterr().out)
+    assert feedback[0]["note"] == "cli signal"
+
+    assert main(["reinforcement", "decay", "--store", str(store), "--rate", "0.5"]) == 0
+    decay = json.loads(capsys.readouterr().out)
+    assert decay["count"] == 1
+
+
 def test_cycle_memory_formatter_maps_reflections_to_procedural_memory(tmp_path):
     runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
     session = runtime.start_session("format bridge memory").session

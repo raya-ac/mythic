@@ -5,10 +5,13 @@ from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryActivationRequest
 from mythic.plugins import PluginHost, PluginManifest, PluginResult, RegisteredPlugin
+from mythic.reinforcement import ActivationFeedback, ActivationOutcome, ReinforcementState
 from mythic.runtime import MythicRuntime
 from mythic.session import CognitiveSession
 
 __all__ = [
+    "ActivationFeedback",
+    "ActivationOutcome",
     "BridgeMemory",
     "BridgePublishResult",
     "CycleMemoryFormatter",
@@ -24,7 +27,8 @@ __all__ = [
     "PluginManifest",
     "PluginResult",
     "ReflectionRecord",
+    "ReinforcementState",
     "RegisteredPlugin",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
