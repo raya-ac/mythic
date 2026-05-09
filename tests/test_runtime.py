@@ -1,7 +1,9 @@
 import json
+import sys
 
 from mythic.memory import MemoryActivation
 from mythic.cli import main
+from mythic.plugins import PluginHost
 from mythic.runtime import MythicRuntime
 from mythic.store import JsonRuntimeStore, SQLiteRuntimeStore
 
@@ -105,3 +107,59 @@ def test_cli_default_sqlite_store_and_events(tmp_path, capsys):
     assert main(["events", "list", "--store", str(store), "--session-id", session["id"]]) == 0
     events = json.loads(capsys.readouterr().out)
     assert events[0]["type"] == "session_started"
+
+
+def write_echo_plugin(path):
+    path.mkdir()
+    (path / "worker.py").write_text(
+        "import sys\nprint(sys.stdin.read().upper(), end='')\n",
+        encoding="utf-8",
+    )
+    (path / "mythic-plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "uppercase",
+                "runtime": "python",
+                "entrypoint": [sys.executable, "worker.py"],
+                "capabilities": ["transform:text"],
+                "timeout_seconds": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_plugin_host_runs_manifest(tmp_path):
+    plugin = tmp_path / "uppercase"
+    write_echo_plugin(plugin)
+
+    result = PluginHost().run(plugin, input_text="mythic")
+
+    assert result.ok
+    assert result.stdout == "MYTHIC"
+
+
+def test_runtime_records_plugin_events(tmp_path):
+    plugin = tmp_path / "uppercase"
+    write_echo_plugin(plugin)
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path / "runtime"))
+
+    step = runtime.run_plugin(str(plugin), input_text="events")
+
+    assert step.result.stdout == "EVENTS"
+    assert [event.type for event in runtime.list_events()] == [
+        "plugin_started",
+        "plugin_completed",
+    ]
+
+
+def test_cli_plugin_run(tmp_path, capsys):
+    plugin = tmp_path / "uppercase"
+    write_echo_plugin(plugin)
+    store = tmp_path / "runtime"
+
+    assert main(["plugin", "run", str(plugin), "--input", "cli", "--store", str(store)]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"]
+    assert result["stdout"] == "CLI"

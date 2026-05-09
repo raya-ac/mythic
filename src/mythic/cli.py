@@ -87,6 +87,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_events_list.add_argument("--session-id")
     p_events_list.add_argument("--limit", type=int, default=50)
 
+    p_plugin = sub.add_parser("plugin", parents=[store_parent], help="Run supervised plugins")
+    plugin_sub = p_plugin.add_subparsers(dest="plugin_command")
+    p_plugin_run = plugin_sub.add_parser("run", parents=[store_parent], help="Run a plugin manifest or directory")
+    p_plugin_run.add_argument("path")
+    p_plugin_run.add_argument("--input", dest="input_text")
+    p_plugin_run.add_argument("--timeout", type=float)
+    p_plugin_run.add_argument("--session-id")
+
     args = parser.parse_args(argv)
 
     if args.version:
@@ -148,6 +156,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "events" and args.events_command == "list":
         events = runtime.list_events(limit=args.limit, session_id=args.session_id)
         print(json.dumps([event.to_dict() for event in events], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "plugin" and args.plugin_command == "run":
+        step = runtime.run_plugin(
+            args.path,
+            input_text=args.input_text,
+            timeout_seconds=args.timeout,
+            session_id=args.session_id,
+        )
+        print(json.dumps(step.result.to_dict(), indent=2, sort_keys=True))
         return 0
 
     parser.print_help()

@@ -18,6 +18,7 @@ This repo is at the first package scaffold:
 - event bus for structured cognition events with persisted event logs
 - planner state primitives
 - memory activation adapter interface
+- supervised plugin runner with manifest-based capabilities
 - optional Engram integration via `mythic[engram]`
 
 ## install
@@ -60,6 +61,25 @@ mythic task add "$SESSION_ID" "wire planner memory"
 mythic task ready "$SESSION_ID"
 ```
 
+Plugins are manifest-driven and run under basic supervision:
+
+```bash
+mythic plugin run ./plugins/example --input "payload"
+mythic events list
+```
+
+A plugin directory contains `mythic-plugin.json`:
+
+```json
+{
+  "name": "uppercase",
+  "runtime": "python",
+  "entrypoint": ["python", "worker.py"],
+  "capabilities": ["transform:text"],
+  "timeout_seconds": 5
+}
+```
+
 ## architecture direction
 
 The first runtime surface is deliberately small:
@@ -70,6 +90,7 @@ foundation model
       -> cognitive session
       -> planner state
       -> memory activation
+      -> plugin host
       -> event stream
       -> runtime store
           -> sqlite / json / engram

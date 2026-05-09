@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryAdapter, NullMemoryAdapter
 from mythic.planner import TaskNode, TaskStatus
+from mythic.plugins import PluginHost, PluginResult
 from mythic.session import CognitiveSession
 from mythic.store import RuntimeStore, SQLiteRuntimeStore
 
@@ -19,6 +20,14 @@ class RuntimeStep:
     events: list[CognitionEvent]
 
 
+@dataclass
+class PluginRunStep:
+    """Result of a supervised plugin execution."""
+
+    result: PluginResult
+    events: list[CognitionEvent]
+
+
 class MythicRuntime:
     """Coordinator for persistent cognitive sessions."""
 
@@ -28,10 +37,12 @@ class MythicRuntime:
         store: RuntimeStore | None = None,
         memory_adapter: MemoryAdapter | None = None,
         event_bus: EventBus | None = None,
+        plugin_host: PluginHost | None = None,
     ):
         self.store = store or SQLiteRuntimeStore()
         self.memory_adapter = memory_adapter or NullMemoryAdapter()
         self.event_bus = event_bus or EventBus()
+        self.plugin_host = plugin_host or PluginHost()
 
     def init(self) -> None:
         self.store.init()
@@ -134,6 +145,41 @@ class MythicRuntime:
     def ready_tasks(self, session: CognitiveSession) -> list[TaskNode]:
         return session.planner.ready_tasks()
 
+    def run_plugin(
+        self,
+        plugin_path: str,
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+        session_id: str | None = None,
+    ) -> PluginRunStep:
+        manifest = self.plugin_host.load_manifest(plugin_path)
+        started = self._emit(
+            "plugin_started",
+            {
+                "plugin": manifest.to_dict(),
+                "input_bytes": len((input_text or "").encode("utf-8")),
+            },
+            session_id=session_id,
+        )
+        result = self.plugin_host.run(
+            plugin_path,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+        )
+        completed = self._emit(
+            "plugin_completed",
+            {
+                "plugin": result.plugin.to_dict(),
+                "ok": result.ok,
+                "returncode": result.returncode,
+                "elapsed_ms": result.elapsed_ms,
+                "timed_out": result.timed_out,
+            },
+            session_id=session_id,
+        )
+        return PluginRunStep(result=result, events=[started, completed])
+
     def list_sessions(self) -> list[CognitiveSession]:
         return self.store.list_sessions()
 
@@ -146,4 +192,4 @@ class MythicRuntime:
         return self.store.list_events(limit=limit, session_id=session_id)
 
 
-__all__ = ["MemoryActivation", "MythicRuntime", "RuntimeStep"]
+__all__ = ["MemoryActivation", "MythicRuntime", "PluginRunStep", "RuntimeStep"]
