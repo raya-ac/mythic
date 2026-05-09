@@ -18,6 +18,7 @@ This repo is at the first runnable runtime layer:
 - event bus for structured cognition events with persisted event logs
 - cognitive cycles that combine planner state, memory activation, and reflection
 - planner-aware memory activation request model
+- memory mesh graph for sessions, goals, tasks, cycles, activations, and manual links
 - adaptive memory reinforcement from activation feedback and decay
 - reflective records for blocked/failed tasks and plugin failures
 - resumable session snapshots
@@ -96,6 +97,24 @@ for the same memory carry `metadata.reinforcement` and receive an adjusted
 `planner_relevance`, so repeatedly useful memory becomes more likely to shape
 planning while contradicted or stale memory is down-weighted.
 
+The memory mesh links runtime objects into a traversable graph:
+
+```bash
+mythic mesh nodes --kind memory
+mythic mesh edges --kind activated
+mythic mesh traverse "$SESSION_ID" --kind session --depth 2
+mythic mesh link mem_a mem_b supports \
+  --source-kind memory \
+  --target-kind memory \
+  --confidence 0.8 \
+  --planner-relevance 0.6
+```
+
+Sessions, planner tasks, cognitive cycles, activated memories, reflections,
+reinforcement feedback, and plugin runs are linked automatically as the runtime
+executes. Manual links let agents add causal, temporal, or project-specific
+relationships that Engram can later use for multi-hop continuity.
+
 Plugins are manifest-driven and run under basic supervision:
 
 ```bash
@@ -128,6 +147,7 @@ foundation model
       -> cognitive cycle
       -> planner state
       -> memory activation
+      -> memory mesh
       -> plugin host
       -> reflection records
       -> event stream
@@ -140,6 +160,7 @@ The long-term target is persistent cognition rather than passive recall:
 - persistent sessions
 - planner-addressable memory
 - memory activation during execution
+- memory mesh traversal
 - adaptive reinforcement
 - plugin-capable supervised runtimes
 - realtime cognition streams

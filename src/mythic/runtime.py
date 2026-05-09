@@ -9,6 +9,7 @@ from mythic.bridge import BridgePublishResult, MemoryBridge, NullMemoryBridge
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryActivationRequest, MemoryAdapter, NullMemoryAdapter
+from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, MeshTraversal, mesh_node_id
 from mythic.planner import TaskNode, TaskStatus
 from mythic.plugins import PluginHost, PluginResult
 from mythic.reinforcement import ActivationFeedback, ActivationOutcome, ReinforcementState, apply_feedback, decay_state
@@ -59,6 +60,15 @@ class DecayStep:
     event: CognitionEvent
 
 
+@dataclass
+class MeshLinkStep:
+    """Result of recording a mesh relationship."""
+
+    source: MemoryMeshNode
+    target: MemoryMeshNode
+    edge: MemoryMeshEdge
+
+
 class MythicRuntime:
     """Coordinator for persistent cognitive sessions."""
 
@@ -92,10 +102,120 @@ class MythicRuntime:
         self.store.save_event(event)
         return event
 
+    def _mesh_node(
+        self,
+        kind: str,
+        identifier: str,
+        *,
+        label: str | None = None,
+        metadata: dict | None = None,
+    ) -> MemoryMeshNode:
+        node = MemoryMeshNode(
+            id=mesh_node_id(kind, identifier),
+            kind=kind,
+            label=label or identifier,
+            metadata=metadata or {},
+        )
+        self.store.save_mesh_node(node)
+        return node
+
+    def _mesh_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        kind: str,
+        *,
+        confidence: float = 1.0,
+        planner_relevance: float = 0.0,
+        emotional_weight: float = 0.0,
+        metadata: dict | None = None,
+    ) -> MemoryMeshEdge:
+        edge = MemoryMeshEdge(
+            source_id=source_id,
+            target_id=target_id,
+            kind=kind,
+            confidence=confidence,
+            planner_relevance=planner_relevance,
+            emotional_weight=emotional_weight,
+            metadata=metadata or {},
+        )
+        self.store.save_mesh_edge(edge)
+        saved = self.store.load_mesh_edge(edge.id)
+        return saved or edge
+
+    def _record_session_mesh(self, session: CognitiveSession) -> None:
+        session_node = self._mesh_node(
+            "session",
+            session.id,
+            label=session.goal,
+            metadata={"status": session.status},
+        )
+        for goal in session.active_goals:
+            goal_node = self._mesh_node("goal", goal, label=goal)
+            self._mesh_edge(session_node.id, goal_node.id, "pursues", metadata={"session_id": session.id})
+        for task in session.planner.tasks.values():
+            task_node = self._mesh_node(
+                "task",
+                task.id,
+                label=task.title,
+                metadata=task.to_dict(),
+            )
+            self._mesh_edge(session_node.id, task_node.id, "has_task", metadata={"status": task.status.value})
+            for dependency_id in task.depends_on:
+                dependency_node = self._mesh_node("task", dependency_id, label=dependency_id)
+                self._mesh_edge(task_node.id, dependency_node.id, "depends_on")
+
+    def _record_cycle_mesh(
+        self,
+        session: CognitiveSession,
+        cycle: CognitiveCycle,
+    ) -> None:
+        session_node = self._mesh_node("session", session.id, label=session.goal)
+        cycle_node = self._mesh_node(
+            "cycle",
+            cycle.id,
+            label=f"cycle {cycle.id}",
+            metadata={"status": cycle.status, "created_at": cycle.created_at},
+        )
+        self._mesh_edge(session_node.id, cycle_node.id, "ran_cycle")
+        for activation in cycle.activations:
+            memory_node = self._mesh_node(
+                "memory",
+                activation.memory_id,
+                label=activation.content_preview or activation.memory_id,
+                metadata={
+                    "layer": activation.layer,
+                    "score": activation.score,
+                    "planner_relevance": activation.planner_relevance,
+                },
+            )
+            self._mesh_edge(
+                cycle_node.id,
+                memory_node.id,
+                "activated",
+                confidence=activation.score,
+                planner_relevance=activation.planner_relevance,
+                metadata={"activation": activation.to_dict()},
+            )
+        for reflection in cycle.reflections:
+            reflection_node = self._mesh_node(
+                "reflection",
+                reflection.id,
+                label=reflection.subject,
+                metadata=reflection.to_dict(),
+            )
+            self._mesh_edge(
+                cycle_node.id,
+                reflection_node.id,
+                "produced_reflection",
+                metadata={"kind": reflection.kind, "severity": reflection.severity},
+            )
+
     def start_session(self, goal: str) -> RuntimeStep:
         session = CognitiveSession(goal=goal)
         root_task = session.planner.add_task(goal, metadata={"kind": "root_goal"})
         self.store.save_session(session)
+        self._record_session_mesh(session)
         event = self._emit(
             "session_started",
             {"goal": goal, "root_task_id": root_task.id},
@@ -105,6 +225,7 @@ class MythicRuntime:
 
     def resume_session(self, session_id: str) -> CognitiveSession:
         session = self.store.load_session(session_id)
+        self._record_session_mesh(session)
         self._emit(
             "session_resumed",
             {"goal": session.goal, "status": session.status},
@@ -218,6 +339,7 @@ class MythicRuntime:
     ) -> RuntimeStep:
         task = session.planner.add_task(title, depends_on=depends_on)
         self.store.save_session(session)
+        self._record_session_mesh(session)
         event = self._emit(
             "planner_task_added",
             {"task": task.to_dict()},
@@ -233,6 +355,7 @@ class MythicRuntime:
     ) -> RuntimeStep:
         task = session.planner.set_status(task_id, status)
         self.store.save_session(session)
+        self._record_session_mesh(session)
         event = self._emit(
             "planner_task_status_changed",
             {"task_id": task_id, "status": task.status.value},
@@ -287,6 +410,7 @@ class MythicRuntime:
             completed_at=time.time(),
         )
         self.store.save_cycle(completed_cycle)
+        self._record_cycle_mesh(session, completed_cycle)
 
         events = [started]
         events.extend(
@@ -362,6 +486,19 @@ class MythicRuntime:
         state = apply_feedback(self.store.load_reinforcement(memory_id), feedback)
         self.store.save_feedback(feedback)
         self.store.save_reinforcement(state)
+        session_node = self._mesh_node("session", session_id, label=session_id)
+        memory_node = self._mesh_node("memory", memory_id, label=memory_id)
+        self._mesh_edge(
+            session_node.id,
+            memory_node.id,
+            "reinforced",
+            planner_relevance=state.score,
+            metadata={
+                "outcome": feedback.outcome.value,
+                "feedback_id": feedback.id,
+                "note": feedback.note,
+            },
+        )
         event = self._emit(
             "memory_reinforced",
             {
@@ -449,6 +586,21 @@ class MythicRuntime:
             session_id=session_id,
         )
         events = [started, completed]
+        if session_id is not None:
+            session_node = self._mesh_node("session", session_id, label=session_id)
+            plugin_node = self._mesh_node(
+                "plugin",
+                result.plugin.name,
+                label=result.plugin.name,
+                metadata=result.plugin.to_dict(),
+            )
+            self._mesh_edge(
+                session_node.id,
+                plugin_node.id,
+                "ran_plugin",
+                confidence=1.0 if result.ok else 0.5,
+                metadata={"ok": result.ok, "elapsed_ms": result.elapsed_ms},
+            )
         if session_id is not None and not result.ok:
             reflection = ReflectionRecord(
                 session_id=session_id,
@@ -512,6 +664,116 @@ class MythicRuntime:
             session_id=session_id,
         )
         return PluginRunStep(result=step.result, events=[selected, *step.events])
+
+    def link_mesh(
+        self,
+        *,
+        source_kind: str,
+        source_identifier: str,
+        target_kind: str,
+        target_identifier: str,
+        kind: str,
+        source_label: str | None = None,
+        target_label: str | None = None,
+        confidence: float = 1.0,
+        planner_relevance: float = 0.0,
+        emotional_weight: float = 0.0,
+        metadata: dict | None = None,
+    ) -> MeshLinkStep:
+        source = self._mesh_node(
+            source_kind,
+            source_identifier,
+            label=source_label,
+        )
+        target = self._mesh_node(
+            target_kind,
+            target_identifier,
+            label=target_label,
+        )
+        edge = self._mesh_edge(
+            source.id,
+            target.id,
+            kind,
+            confidence=confidence,
+            planner_relevance=planner_relevance,
+            emotional_weight=emotional_weight,
+            metadata=metadata,
+        )
+        return MeshLinkStep(source=source, target=target, edge=edge)
+
+    def list_mesh_nodes(
+        self,
+        *,
+        limit: int = 50,
+        kind: str | None = None,
+    ) -> list[MemoryMeshNode]:
+        return self.store.list_mesh_nodes(limit=limit, kind=kind)
+
+    def list_mesh_edges(
+        self,
+        *,
+        limit: int = 50,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[MemoryMeshEdge]:
+        return self.store.list_mesh_edges(
+            limit=limit,
+            source_id=source_id,
+            target_id=target_id,
+            kind=kind,
+        )
+
+    def traverse_mesh(
+        self,
+        identifier: str,
+        *,
+        kind: str | None = None,
+        depth: int = 2,
+        limit: int = 50,
+    ) -> MeshTraversal:
+        root_id = mesh_node_id(kind, identifier) if kind is not None else identifier
+        root = self.store.load_mesh_node(root_id)
+        if root is None:
+            return MeshTraversal(root_id=root_id, depth=depth)
+
+        max_depth = max(0, depth)
+        max_items = max(0, limit)
+        all_edges = self.store.list_mesh_edges(limit=0)
+        edge_by_node: dict[str, list[MemoryMeshEdge]] = {}
+        for edge in all_edges:
+            edge_by_node.setdefault(edge.source_id, []).append(edge)
+            edge_by_node.setdefault(edge.target_id, []).append(edge)
+
+        nodes: dict[str, MemoryMeshNode] = {root.id: root}
+        edges: dict[str, MemoryMeshEdge] = {}
+        frontier: list[tuple[str, int]] = [(root.id, 0)]
+        visited: set[str] = set()
+
+        while frontier and (max_items == 0 or len(nodes) < max_items):
+            node_id, current_depth = frontier.pop(0)
+            if node_id in visited or current_depth >= max_depth:
+                visited.add(node_id)
+                continue
+            visited.add(node_id)
+            for edge in edge_by_node.get(node_id, []):
+                edges[edge.id] = edge
+                other_id = edge.target_id if edge.source_id == node_id else edge.source_id
+                if other_id not in nodes:
+                    other = self.store.load_mesh_node(other_id)
+                    if other is not None:
+                        nodes[other_id] = other
+                if other_id not in visited:
+                    frontier.append((other_id, current_depth + 1))
+                if max_items > 0 and len(nodes) >= max_items:
+                    break
+
+        ordered_nodes = sorted(nodes.values(), key=lambda node: node.updated_at, reverse=True)
+        ordered_edges = sorted(edges.values(), key=lambda edge: edge.updated_at, reverse=True)
+        if max_items > 0:
+            ordered_nodes = ordered_nodes[:max_items]
+            ordered_edges = ordered_edges[:max_items]
+        return MeshTraversal(root_id=root_id, depth=max_depth, nodes=ordered_nodes, edges=ordered_edges)
 
     def list_sessions(self) -> list[CognitiveSession]:
         return self.store.list_sessions()
@@ -599,6 +861,7 @@ class MythicRuntime:
                 event.to_dict()
                 for event in self.list_events(session_id=session.id, limit=limit)
             ],
+            "memory_mesh": self.traverse_mesh(session.id, kind="session", depth=2, limit=limit).to_dict(),
             "suggested_next_actions": suggestions[:limit],
         }
 
@@ -606,7 +869,11 @@ __all__ = [
     "CycleStep",
     "DecayStep",
     "FeedbackStep",
+    "MeshLinkStep",
     "MemoryActivation",
+    "MemoryMeshEdge",
+    "MemoryMeshNode",
+    "MeshTraversal",
     "MythicRuntime",
     "PluginRunStep",
     "RuntimeStep",

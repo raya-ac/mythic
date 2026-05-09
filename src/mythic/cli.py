@@ -15,6 +15,18 @@ from mythic.runtime import MythicRuntime
 from mythic.store import make_runtime_store
 
 
+def _json_object(value: str | None) -> dict | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("metadata must be a JSON object")
+    return parsed
+
+
 def _runtime(args: argparse.Namespace) -> MythicRuntime:
     adapter = NullMemoryAdapter()
     if getattr(args, "engram", False):
@@ -151,6 +163,38 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     p_reinforce_decay = reinforcement_sub.add_parser("decay", parents=[store_parent], help="Decay reinforcement scores toward zero")
     p_reinforce_decay.add_argument("--rate", type=float, default=0.05)
+
+    p_mesh = sub.add_parser("mesh", parents=[store_parent], help="Inspect and link the memory mesh")
+    mesh_sub = p_mesh.add_subparsers(dest="mesh_command")
+
+    p_mesh_link = mesh_sub.add_parser("link", parents=[store_parent], help="Create or reinforce a mesh edge")
+    p_mesh_link.add_argument("source")
+    p_mesh_link.add_argument("target")
+    p_mesh_link.add_argument("kind")
+    p_mesh_link.add_argument("--source-kind", default="memory")
+    p_mesh_link.add_argument("--target-kind", default="memory")
+    p_mesh_link.add_argument("--source-label")
+    p_mesh_link.add_argument("--target-label")
+    p_mesh_link.add_argument("--confidence", type=float, default=1.0)
+    p_mesh_link.add_argument("--planner-relevance", type=float, default=0.0)
+    p_mesh_link.add_argument("--emotional-weight", type=float, default=0.0)
+    p_mesh_link.add_argument("--metadata", type=_json_object)
+
+    p_mesh_nodes = mesh_sub.add_parser("nodes", parents=[store_parent], help="List mesh nodes")
+    p_mesh_nodes.add_argument("--kind")
+    p_mesh_nodes.add_argument("--limit", type=int, default=50)
+
+    p_mesh_edges = mesh_sub.add_parser("edges", parents=[store_parent], help="List mesh edges")
+    p_mesh_edges.add_argument("--source-id")
+    p_mesh_edges.add_argument("--target-id")
+    p_mesh_edges.add_argument("--kind")
+    p_mesh_edges.add_argument("--limit", type=int, default=50)
+
+    p_mesh_traverse = mesh_sub.add_parser("traverse", parents=[store_parent], help="Traverse the mesh from one node")
+    p_mesh_traverse.add_argument("root")
+    p_mesh_traverse.add_argument("--kind")
+    p_mesh_traverse.add_argument("--depth", type=int, default=2)
+    p_mesh_traverse.add_argument("--limit", type=int, default=50)
 
     p_plugin = sub.add_parser("plugin", parents=[store_parent], help="Run supervised plugins")
     plugin_sub = p_plugin.add_subparsers(dest="plugin_command")
@@ -307,6 +351,58 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "mesh" and args.mesh_command == "link":
+        step = runtime.link_mesh(
+            source_kind=args.source_kind,
+            source_identifier=args.source,
+            target_kind=args.target_kind,
+            target_identifier=args.target,
+            kind=args.kind,
+            source_label=args.source_label,
+            target_label=args.target_label,
+            confidence=args.confidence,
+            planner_relevance=args.planner_relevance,
+            emotional_weight=args.emotional_weight,
+            metadata=args.metadata,
+        )
+        print(
+            json.dumps(
+                {
+                    "source": step.source.to_dict(),
+                    "target": step.target.to_dict(),
+                    "edge": step.edge.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "mesh" and args.mesh_command == "nodes":
+        nodes = runtime.list_mesh_nodes(limit=args.limit, kind=args.kind)
+        print(json.dumps([node.to_dict() for node in nodes], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "mesh" and args.mesh_command == "edges":
+        edges = runtime.list_mesh_edges(
+            limit=args.limit,
+            source_id=args.source_id,
+            target_id=args.target_id,
+            kind=args.kind,
+        )
+        print(json.dumps([edge.to_dict() for edge in edges], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "mesh" and args.mesh_command == "traverse":
+        traversal = runtime.traverse_mesh(
+            args.root,
+            kind=args.kind,
+            depth=args.depth,
+            limit=args.limit,
+        )
+        print(json.dumps(traversal.to_dict(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "plugin" and args.plugin_command == "run":

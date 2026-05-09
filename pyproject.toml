@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mythic-cognition-runtime"
-version = "0.4.0"
+version = "0.5.0"
 description = "Persistent cognition runtime layer for Engram."
 readme = "README.md"
 requires-python = ">=3.11"

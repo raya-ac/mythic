@@ -9,6 +9,7 @@ from typing import Protocol
 
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.events import CognitionEvent
+from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, merge_mesh_edge
 from mythic.reinforcement import ActivationFeedback, ReinforcementState
 from mythic.session import CognitiveSession
 
@@ -69,6 +70,30 @@ class RuntimeStore(Protocol):
 
     def list_reinforcements(self, *, limit: int = 50) -> list[ReinforcementState]: ...
 
+    def save_mesh_node(self, node: MemoryMeshNode) -> None: ...
+
+    def load_mesh_node(self, node_id: str) -> MemoryMeshNode | None: ...
+
+    def list_mesh_nodes(
+        self,
+        *,
+        limit: int = 50,
+        kind: str | None = None,
+    ) -> list[MemoryMeshNode]: ...
+
+    def save_mesh_edge(self, edge: MemoryMeshEdge) -> None: ...
+
+    def load_mesh_edge(self, edge_id: str) -> MemoryMeshEdge | None: ...
+
+    def list_mesh_edges(
+        self,
+        *,
+        limit: int = 50,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[MemoryMeshEdge]: ...
+
 
 class JsonRuntimeStore:
     """Small transparent persistence backend for debugging runtime state."""
@@ -81,6 +106,8 @@ class JsonRuntimeStore:
         self.reflections_path = self.root / "reflections.jsonl"
         self.feedback_path = self.root / "activation_feedback.jsonl"
         self.reinforcement_path = self.root / "reinforcement.json"
+        self.mesh_nodes_path = self.root / "mesh_nodes.json"
+        self.mesh_edges_path = self.root / "mesh_edges.json"
 
     def init(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +267,105 @@ class JsonRuntimeStore:
             states = states[:limit]
         return states
 
+    def _mesh_nodes_payload(self) -> dict[str, dict]:
+        if not self.mesh_nodes_path.exists():
+            return {}
+        return json.loads(self.mesh_nodes_path.read_text(encoding="utf-8"))
+
+    def _mesh_edges_payload(self) -> dict[str, dict]:
+        if not self.mesh_edges_path.exists():
+            return {}
+        return json.loads(self.mesh_edges_path.read_text(encoding="utf-8"))
+
+    def save_mesh_node(self, node: MemoryMeshNode) -> None:
+        self.init()
+        payload = self._mesh_nodes_payload()
+        existing = payload.get(node.id)
+        if existing is not None:
+            existing_metadata = dict(existing.get("metadata", {}))
+            existing_metadata.update(node.metadata)
+            node = MemoryMeshNode(
+                id=node.id,
+                kind=node.kind,
+                label=node.label,
+                metadata=existing_metadata,
+                created_at=float(existing.get("created_at", node.created_at)),
+                updated_at=node.updated_at,
+            )
+        payload[node.id] = node.to_dict()
+        self.mesh_nodes_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def load_mesh_node(self, node_id: str) -> MemoryMeshNode | None:
+        self.init()
+        payload = self._mesh_nodes_payload().get(node_id)
+        if payload is None:
+            return None
+        return MemoryMeshNode.from_dict(payload)
+
+    def list_mesh_nodes(
+        self,
+        *,
+        limit: int = 50,
+        kind: str | None = None,
+    ) -> list[MemoryMeshNode]:
+        self.init()
+        nodes = [
+            MemoryMeshNode.from_dict(item)
+            for item in self._mesh_nodes_payload().values()
+        ]
+        if kind is not None:
+            nodes = [node for node in nodes if node.kind == kind]
+        nodes = sorted(nodes, key=lambda node: node.updated_at, reverse=True)
+        if limit > 0:
+            nodes = nodes[:limit]
+        return nodes
+
+    def save_mesh_edge(self, edge: MemoryMeshEdge) -> None:
+        self.init()
+        payload = self._mesh_edges_payload()
+        existing = payload.get(edge.id)
+        if existing is not None:
+            edge = merge_mesh_edge(MemoryMeshEdge.from_dict(existing), edge)
+        payload[edge.id] = edge.to_dict()
+        self.mesh_edges_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def load_mesh_edge(self, edge_id: str) -> MemoryMeshEdge | None:
+        self.init()
+        payload = self._mesh_edges_payload().get(edge_id)
+        if payload is None:
+            return None
+        return MemoryMeshEdge.from_dict(payload)
+
+    def list_mesh_edges(
+        self,
+        *,
+        limit: int = 50,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[MemoryMeshEdge]:
+        self.init()
+        edges = [
+            MemoryMeshEdge.from_dict(item)
+            for item in self._mesh_edges_payload().values()
+        ]
+        if source_id is not None:
+            edges = [edge for edge in edges if edge.source_id == source_id]
+        if target_id is not None:
+            edges = [edge for edge in edges if edge.target_id == target_id]
+        if kind is not None:
+            edges = [edge for edge in edges if edge.kind == kind]
+        edges = sorted(edges, key=lambda edge: edge.updated_at, reverse=True)
+        if limit > 0:
+            edges = edges[:limit]
+        return edges
+
 
 class SQLiteRuntimeStore:
     """SQLite-backed local-first persistence for sessions and cognition events."""
@@ -345,6 +471,40 @@ class SQLiteRuntimeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_reinforcement_updated
                 ON reinforcement_state(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS mesh_nodes (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mesh_nodes_kind
+                ON mesh_nodes(kind, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_mesh_nodes_updated
+                ON mesh_nodes(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS mesh_edges (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                planner_relevance REAL NOT NULL,
+                emotional_weight REAL NOT NULL,
+                activation_count INTEGER NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_activated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mesh_edges_source
+                ON mesh_edges(source_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_mesh_edges_target
+                ON mesh_edges(target_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_mesh_edges_kind
+                ON mesh_edges(kind, updated_at DESC);
             """
         )
         self.conn.commit()
@@ -724,6 +884,222 @@ class SQLiteRuntimeStore:
                 """
             ).fetchall()
         return [ReinforcementState.from_dict(dict(row)) for row in rows]
+
+    def save_mesh_node(self, node: MemoryMeshNode) -> None:
+        self.init()
+        existing = self.load_mesh_node(node.id)
+        if existing is not None:
+            metadata = dict(existing.metadata)
+            metadata.update(node.metadata)
+            node = MemoryMeshNode(
+                id=node.id,
+                kind=node.kind,
+                label=node.label,
+                metadata=metadata,
+                created_at=existing.created_at,
+                updated_at=node.updated_at,
+            )
+        self.conn.execute(
+            """
+            INSERT INTO mesh_nodes (id, kind, label, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                label = excluded.label,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            """,
+            (
+                node.id,
+                node.kind,
+                node.label,
+                json.dumps(node.metadata, sort_keys=True),
+                node.created_at,
+                node.updated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def load_mesh_node(self, node_id: str) -> MemoryMeshNode | None:
+        self.init()
+        row = self.conn.execute(
+            "SELECT * FROM mesh_nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryMeshNode(
+            id=row["id"],
+            kind=row["kind"],
+            label=row["label"],
+            metadata=json.loads(row["metadata"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def list_mesh_nodes(
+        self,
+        *,
+        limit: int = 50,
+        kind: str | None = None,
+    ) -> list[MemoryMeshNode]:
+        self.init()
+        params: list[object] = []
+        where = ""
+        if kind is not None:
+            where = "WHERE kind = ?"
+            params.append(kind)
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM mesh_nodes
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM mesh_nodes
+                {where}
+                ORDER BY updated_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [
+            MemoryMeshNode(
+                id=row["id"],
+                kind=row["kind"],
+                label=row["label"],
+                metadata=json.loads(row["metadata"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    def save_mesh_edge(self, edge: MemoryMeshEdge) -> None:
+        self.init()
+        existing = self.load_mesh_edge(edge.id)
+        if existing is not None:
+            edge = merge_mesh_edge(existing, edge)
+        self.conn.execute(
+            """
+            INSERT INTO mesh_edges
+            (id, source_id, target_id, kind, confidence, planner_relevance, emotional_weight,
+             activation_count, metadata, created_at, updated_at, last_activated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                confidence = excluded.confidence,
+                planner_relevance = excluded.planner_relevance,
+                emotional_weight = excluded.emotional_weight,
+                activation_count = excluded.activation_count,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at,
+                last_activated_at = excluded.last_activated_at
+            """,
+            (
+                edge.id,
+                edge.source_id,
+                edge.target_id,
+                edge.kind,
+                edge.confidence,
+                edge.planner_relevance,
+                edge.emotional_weight,
+                edge.activation_count,
+                json.dumps(edge.metadata, sort_keys=True),
+                edge.created_at,
+                edge.updated_at,
+                edge.last_activated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def load_mesh_edge(self, edge_id: str) -> MemoryMeshEdge | None:
+        self.init()
+        row = self.conn.execute(
+            "SELECT * FROM mesh_edges WHERE id = ?",
+            (edge_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryMeshEdge(
+            id=row["id"],
+            source_id=row["source_id"],
+            target_id=row["target_id"],
+            kind=row["kind"],
+            confidence=row["confidence"],
+            planner_relevance=row["planner_relevance"],
+            emotional_weight=row["emotional_weight"],
+            activation_count=row["activation_count"],
+            metadata=json.loads(row["metadata"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            last_activated_at=row["last_activated_at"],
+        )
+
+    def list_mesh_edges(
+        self,
+        *,
+        limit: int = 50,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[MemoryMeshEdge]:
+        self.init()
+        params: list[object] = []
+        filters: list[str] = []
+        if source_id is not None:
+            filters.append("source_id = ?")
+            params.append(source_id)
+        if target_id is not None:
+            filters.append("target_id = ?")
+            params.append(target_id)
+        if kind is not None:
+            filters.append("kind = ?")
+            params.append(kind)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM mesh_edges
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM mesh_edges
+                {where}
+                ORDER BY updated_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [
+            MemoryMeshEdge(
+                id=row["id"],
+                source_id=row["source_id"],
+                target_id=row["target_id"],
+                kind=row["kind"],
+                confidence=row["confidence"],
+                planner_relevance=row["planner_relevance"],
+                emotional_weight=row["emotional_weight"],
+                activation_count=row["activation_count"],
+                metadata=json.loads(row["metadata"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                last_activated_at=row["last_activated_at"],
+            )
+            for row in rows
+        ]
 
     def close(self) -> None:
         if self._conn is not None:

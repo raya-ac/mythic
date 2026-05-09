@@ -4,6 +4,7 @@ import sys
 from mythic.bridge import BridgePublishResult, CycleMemoryFormatter
 from mythic.memory import MemoryActivation
 from mythic.cli import main
+from mythic.mesh import mesh_node_id
 from mythic.planner import TaskStatus
 from mythic.plugins import PluginHost
 from mythic.runtime import MythicRuntime
@@ -181,6 +182,109 @@ def test_cycle_publish_uses_memory_bridge(tmp_path):
     assert bridge.cycles[0][0].id == step.cycle.id
     assert bridge.cycles[0][1]["session"]["id"] == session.id
     assert step.events[-1].type == "bridge_publish_completed"
+
+
+def test_runtime_records_session_cycle_memory_mesh(tmp_path):
+    runtime = MythicRuntime(
+        store=SQLiteRuntimeStore(tmp_path),
+        memory_adapter=StaticMemoryAdapter(),
+    )
+    session = runtime.start_session("mesh runtime state").session
+    runtime.add_task(session, "connect activated memory")
+    cycle = runtime.run_cycle(session).cycle
+
+    node_ids = {node.id for node in runtime.list_mesh_nodes(limit=0)}
+    edge_kinds = {edge.kind for edge in runtime.list_mesh_edges(limit=0)}
+    traversal = runtime.traverse_mesh(session.id, kind="session", depth=2, limit=20)
+    traversal_node_ids = {node.id for node in traversal.nodes}
+
+    assert mesh_node_id("session", session.id) in node_ids
+    assert mesh_node_id("cycle", cycle.id) in node_ids
+    assert mesh_node_id("memory", "mem_1") in node_ids
+    assert "ran_cycle" in edge_kinds
+    assert "activated" in edge_kinds
+    assert mesh_node_id("memory", "mem_1") in traversal_node_ids
+    assert traversal.edges
+
+
+def test_mesh_link_merges_repeated_edges(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+
+    first = runtime.link_mesh(
+        source_kind="memory",
+        source_identifier="mem_a",
+        target_kind="memory",
+        target_identifier="mem_b",
+        kind="supports",
+        confidence=0.4,
+    )
+    second = runtime.link_mesh(
+        source_kind="memory",
+        source_identifier="mem_a",
+        target_kind="memory",
+        target_identifier="mem_b",
+        kind="supports",
+        confidence=0.9,
+        planner_relevance=0.7,
+    )
+
+    assert first.edge.id == second.edge.id
+    assert second.edge.activation_count == 2
+    assert second.edge.confidence == 0.9
+    assert second.edge.planner_relevance == 0.7
+
+
+def test_json_store_persists_mesh(tmp_path):
+    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    runtime.link_mesh(
+        source_kind="memory",
+        source_identifier="mem_a",
+        target_kind="task",
+        target_identifier="task_a",
+        kind="informs",
+    )
+
+    reloaded = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    traversal = reloaded.traverse_mesh("mem_a", kind="memory")
+
+    assert reloaded.list_mesh_edges()[0].kind == "informs"
+    assert mesh_node_id("task", "task_a") in {node.id for node in traversal.nodes}
+
+
+def test_cli_mesh_commands(tmp_path, capsys):
+    store = tmp_path / "runtime"
+
+    assert main([
+        "mesh",
+        "link",
+        "mem_a",
+        "mem_b",
+        "supports",
+        "--store",
+        str(store),
+        "--confidence",
+        "0.8",
+        "--planner-relevance",
+        "0.6",
+        "--metadata",
+        "{\"reason\":\"manual\"}",
+    ]) == 0
+    link = json.loads(capsys.readouterr().out)
+    assert link["edge"]["kind"] == "supports"
+    assert link["edge"]["metadata"]["reason"] == "manual"
+
+    assert main(["mesh", "nodes", "--store", str(store), "--kind", "memory"]) == 0
+    nodes = json.loads(capsys.readouterr().out)
+    assert {node["id"] for node in nodes} == {"memory:mem_a", "memory:mem_b"}
+
+    assert main(["mesh", "edges", "--store", str(store), "--source-id", "memory:mem_a"]) == 0
+    edges = json.loads(capsys.readouterr().out)
+    assert edges[0]["target_id"] == "memory:mem_b"
+
+    assert main(["mesh", "traverse", "mem_a", "--kind", "memory", "--store", str(store)]) == 0
+    traversal = json.loads(capsys.readouterr().out)
+    assert traversal["root_id"] == "memory:mem_a"
+    assert "memory:mem_b" in {node["id"] for node in traversal["nodes"]}
 
 
 def test_feedback_reinforces_future_activation(tmp_path):
