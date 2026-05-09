@@ -30,6 +30,16 @@ class CognitionEvent:
             "data": self.data,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CognitionEvent":
+        return cls(
+            event_id=data["event_id"],
+            type=data["type"],
+            session_id=data.get("session_id"),
+            timestamp=float(data["timestamp"]),
+            data=dict(data.get("data", {})),
+        )
+
 
 EventCallback = Callable[[CognitionEvent], None]
 
@@ -90,4 +100,3 @@ class EventBus:
         finally:
             if queue in self._queues:
                 self._queues.remove(queue)
-

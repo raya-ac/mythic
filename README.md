@@ -13,8 +13,9 @@ This repo is at the first package scaffold:
 
 - Python package: `mythic`
 - CLI entrypoint: `mythic`
-- local JSON runtime store for early session state
-- event bus for structured cognition events
+- SQLite runtime store for durable session and event state
+- optional JSON runtime store for transparent local debugging
+- event bus for structured cognition events with persisted event logs
 - planner state primitives
 - memory activation adapter interface
 - optional Engram integration via `mythic[engram]`
@@ -39,9 +40,25 @@ pip install -e ".[engram]"
 mythic init
 mythic session start "build a persistent cognition runtime for engram"
 mythic session list
+mythic events list
 ```
 
-Session state is stored locally under `.mythic/` by default.
+Session and event state is stored in `.mythic/runtime.db` by default.
+
+Use JSON files instead when you want easily inspected local state:
+
+```bash
+mythic init --backend json
+mythic session start "inspectable runtime state" --backend json
+```
+
+Planner tasks are part of session state:
+
+```bash
+SESSION_ID=...
+mythic task add "$SESSION_ID" "wire planner memory"
+mythic task ready "$SESSION_ID"
+```
 
 ## architecture direction
 
@@ -55,7 +72,7 @@ foundation model
       -> memory activation
       -> event stream
       -> runtime store
-          -> engram / sqlite / postgres / filesystem
+          -> sqlite / json / engram
 ```
 
 The long-term target is persistent cognition rather than passive recall:
@@ -74,4 +91,3 @@ The long-term target is persistent cognition rather than passive recall:
 PYTHONPATH=src python3 -m pytest -q
 PYTHONPATH=src python3 -m mythic --version
 ```
-

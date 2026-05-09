@@ -1,7 +1,9 @@
+import json
+
 from mythic.memory import MemoryActivation
 from mythic.cli import main
 from mythic.runtime import MythicRuntime
-from mythic.store import JsonRuntimeStore
+from mythic.store import JsonRuntimeStore, SQLiteRuntimeStore
 
 
 class StaticMemoryAdapter:
@@ -18,7 +20,7 @@ class StaticMemoryAdapter:
 
 
 def test_session_start_persists_root_goal(tmp_path):
-    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
 
     step = runtime.start_session("build mythic")
 
@@ -46,7 +48,7 @@ def test_memory_activation_emits_events_and_persists(tmp_path):
 
 
 def test_checkpoint_round_trips(tmp_path):
-    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
     session = runtime.start_session("ship package").session
 
     runtime.checkpoint(session, "first repo scaffold")
@@ -55,11 +57,51 @@ def test_checkpoint_round_trips(tmp_path):
     assert loaded.reasoning_history == ["[checkpoint] first repo scaffold"]
 
 
-def test_cli_accepts_store_after_subcommands(tmp_path):
+def test_cli_accepts_json_store_after_subcommands(tmp_path):
     store = tmp_path / "runtime"
 
-    assert main(["init", "--store", str(store)]) == 0
-    assert main(["session", "start", "cli store smoke", "--store", str(store)]) == 0
+    assert main(["init", "--store", str(store), "--backend", "json"]) == 0
+    assert main(["session", "start", "cli store smoke", "--store", str(store), "--backend", "json"]) == 0
 
     sessions = JsonRuntimeStore(store).list_sessions()
     assert sessions[0].goal == "cli store smoke"
+
+
+def test_sqlite_store_persists_events(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("persist cognition events").session
+
+    runtime.checkpoint(session, "event log survives restart")
+
+    reloaded_runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    events = reloaded_runtime.list_events(session_id=session.id)
+    assert [event.type for event in events] == [
+        "session_started",
+        "session_checkpoint",
+    ]
+
+
+def test_planner_tasks_round_trip(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("plan runtime work").session
+
+    step = runtime.add_task(session, "wire event persistence")
+
+    loaded = runtime.resume_session(session.id)
+    assert any(task.title == "wire event persistence" for task in loaded.planner.tasks.values())
+    assert step.events[0].type == "planner_task_added"
+
+
+def test_cli_default_sqlite_store_and_events(tmp_path, capsys):
+    store = tmp_path / "runtime"
+
+    assert main(["init", "--store", str(store)]) == 0
+    capsys.readouterr()
+
+    assert main(["session", "start", "cli sqlite smoke", "--store", str(store)]) == 0
+    session = json.loads(capsys.readouterr().out)
+
+    assert (store / "runtime.db").exists()
+    assert main(["events", "list", "--store", str(store), "--session-id", session["id"]]) == 0
+    events = json.loads(capsys.readouterr().out)
+    assert events[0]["type"] == "session_started"
