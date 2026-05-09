@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mythic-cognition-runtime"
-version = "0.1.0"
+version = "0.1.1"
 description = "Persistent cognition runtime layer for Engram."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,4 +46,3 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mythic"]
-
