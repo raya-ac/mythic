@@ -7,6 +7,7 @@ import json
 from typing import Sequence
 
 from mythic import __version__
+from mythic.bridge import EngramMemoryBridge, NullMemoryBridge
 from mythic.memory import EngramMemoryAdapter, NullMemoryAdapter
 from mythic.planner import TaskStatus
 from mythic.runtime import MythicRuntime
@@ -17,9 +18,13 @@ def _runtime(args: argparse.Namespace) -> MythicRuntime:
     adapter = NullMemoryAdapter()
     if getattr(args, "engram", False):
         adapter = EngramMemoryAdapter(getattr(args, "engram_config", None))
+    bridge = NullMemoryBridge()
+    if getattr(args, "bridge", "none") == "engram":
+        bridge = EngramMemoryBridge(getattr(args, "bridge_engram_config", None))
     return MythicRuntime(
         store=make_runtime_store(args.store, backend=args.backend),
         memory_adapter=adapter,
+        memory_bridge=bridge,
     )
 
 
@@ -32,11 +37,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=argparse.SUPPRESS,
         help="Runtime store backend",
     )
+    store_parent.add_argument(
+        "--bridge",
+        choices=["none", "engram"],
+        default=argparse.SUPPRESS,
+        help="External memory bridge for published runtime records",
+    )
+    store_parent.add_argument(
+        "--bridge-engram-config",
+        default=argparse.SUPPRESS,
+        help="Engram config path for --bridge engram",
+    )
 
     parser = argparse.ArgumentParser(prog="mythic", description="Persistent cognition runtime")
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     parser.add_argument("--store", default=".mythic", help="Runtime store directory")
     parser.add_argument("--backend", choices=["sqlite", "json"], default="sqlite", help="Runtime store backend")
+    parser.add_argument("--bridge", choices=["none", "engram"], default="none", help="External memory bridge")
+    parser.add_argument("--bridge-engram-config", help="Engram config path for --bridge engram")
 
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("init", parents=[store_parent], help="Initialize local runtime state")
@@ -61,6 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_cycle.add_argument("-k", "--top-k", type=int, default=5)
     p_cycle.add_argument("--engram", action="store_true", help="Use Engram for memory activation")
     p_cycle.add_argument("--engram-config", help="Path to Engram config.yaml")
+    p_cycle.add_argument("--publish", action="store_true", help="Publish cycle summary through the configured bridge")
 
     p_checkpoint = session_sub.add_parser("checkpoint", parents=[store_parent], help="Checkpoint a session")
     p_checkpoint.add_argument("session_id")
@@ -155,8 +174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "session" and args.session_command == "cycle":
         session = runtime.resume_session(args.session_id)
-        step = runtime.run_cycle(session, top_k=args.top_k)
-        print(json.dumps(step.cycle.to_dict(), indent=2, sort_keys=True))
+        step = runtime.run_cycle(session, top_k=args.top_k, publish=args.publish)
+        payload = step.cycle.to_dict()
+        if step.bridge_result is not None:
+            payload["bridge_result"] = step.bridge_result.to_dict()
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     if args.command == "session" and args.session_command == "checkpoint":

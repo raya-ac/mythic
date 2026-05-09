@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from mythic.bridge import BridgePublishResult, MemoryBridge, NullMemoryBridge
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryActivationRequest, MemoryAdapter, NullMemoryAdapter
@@ -37,6 +38,7 @@ class CycleStep:
     session: CognitiveSession
     cycle: CognitiveCycle
     events: list[CognitionEvent]
+    bridge_result: BridgePublishResult | None = None
 
 
 class MythicRuntime:
@@ -47,11 +49,13 @@ class MythicRuntime:
         *,
         store: RuntimeStore | None = None,
         memory_adapter: MemoryAdapter | None = None,
+        memory_bridge: MemoryBridge | None = None,
         event_bus: EventBus | None = None,
         plugin_host: PluginHost | None = None,
     ):
         self.store = store or SQLiteRuntimeStore()
         self.memory_adapter = memory_adapter or NullMemoryAdapter()
+        self.memory_bridge = memory_bridge or NullMemoryBridge()
         self.event_bus = event_bus or EventBus()
         self.plugin_host = plugin_host or PluginHost()
 
@@ -194,7 +198,13 @@ class MythicRuntime:
     def ready_tasks(self, session: CognitiveSession) -> list[TaskNode]:
         return session.planner.ready_tasks()
 
-    def run_cycle(self, session: CognitiveSession, *, top_k: int = 5) -> CycleStep:
+    def run_cycle(
+        self,
+        session: CognitiveSession,
+        *,
+        top_k: int = 5,
+        publish: bool = False,
+    ) -> CycleStep:
         cycle = CognitiveCycle(
             session_id=session.id,
             activation_request=self._activation_request(session),
@@ -261,7 +271,24 @@ class MythicRuntime:
                 session_id=session.id,
             )
         )
-        return CycleStep(session=session, cycle=completed_cycle, events=events)
+
+        bridge_result = None
+        if publish:
+            snapshot = self.session_snapshot(session)
+            bridge_result = self.memory_bridge.publish_cycle(completed_cycle, snapshot=snapshot)
+            events.append(
+                self._emit(
+                    "bridge_publish_completed",
+                    {
+                        "record_type": "cycle",
+                        "cycle_id": completed_cycle.id,
+                        "result": bridge_result.to_dict(),
+                    },
+                    session_id=session.id,
+                )
+            )
+
+        return CycleStep(session=session, cycle=completed_cycle, events=events, bridge_result=bridge_result)
 
     def _reflect_on_session(self, session: CognitiveSession, *, cycle_id: str) -> list[ReflectionRecord]:
         reflections: list[ReflectionRecord] = []
@@ -343,6 +370,19 @@ class MythicRuntime:
                     session_id=session_id,
                 )
             )
+            bridge_result = self.memory_bridge.publish_reflection(reflection)
+            if bridge_result.backend != "none":
+                events.append(
+                    self._emit(
+                        "bridge_publish_completed",
+                        {
+                            "record_type": "reflection",
+                            "reflection_id": reflection.id,
+                            "result": bridge_result.to_dict(),
+                        },
+                        session_id=session_id,
+                    )
+                )
         return PluginRunStep(result=result, events=events)
 
     def discover_plugins(self, plugin_root: str) -> list[dict]:

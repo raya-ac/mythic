@@ -1,6 +1,7 @@
 import json
 import sys
 
+from mythic.bridge import BridgePublishResult, CycleMemoryFormatter
 from mythic.memory import MemoryActivation
 from mythic.cli import main
 from mythic.planner import TaskStatus
@@ -25,6 +26,22 @@ class StaticMemoryAdapter:
                 metadata={"query": request.to_query()},
             )
         ][:top_k]
+
+
+class RecordingBridge:
+    backend = "recording"
+
+    def __init__(self):
+        self.cycles = []
+        self.reflections = []
+
+    def publish_cycle(self, cycle, snapshot=None):
+        self.cycles.append((cycle, snapshot))
+        return BridgePublishResult(backend=self.backend, memory_ids=[f"cycle:{cycle.id}"])
+
+    def publish_reflection(self, reflection):
+        self.reflections.append(reflection)
+        return BridgePublishResult(backend=self.backend, memory_ids=[f"reflection:{reflection.id}"])
 
 
 def test_session_start_persists_root_goal(tmp_path):
@@ -147,6 +164,42 @@ def test_session_snapshot_collects_runtime_state(tmp_path):
     assert snapshot["recent_cycles"]
     assert snapshot["recent_events"]
     assert snapshot["suggested_next_actions"]
+
+
+def test_cycle_publish_uses_memory_bridge(tmp_path):
+    bridge = RecordingBridge()
+    runtime = MythicRuntime(
+        store=SQLiteRuntimeStore(tmp_path),
+        memory_adapter=StaticMemoryAdapter(),
+        memory_bridge=bridge,
+    )
+    session = runtime.start_session("publish cycle").session
+
+    step = runtime.run_cycle(session, publish=True)
+
+    assert step.bridge_result.memory_ids == [f"cycle:{step.cycle.id}"]
+    assert bridge.cycles[0][0].id == step.cycle.id
+    assert bridge.cycles[0][1]["session"]["id"] == session.id
+    assert step.events[-1].type == "bridge_publish_completed"
+
+
+def test_cycle_memory_formatter_maps_reflections_to_procedural_memory(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("format bridge memory").session
+    step = runtime.add_task(session, "blocked task")
+    task_id = next(task.id for task in step.session.planner.tasks.values() if task.title == "blocked task")
+    runtime.set_task_status(step.session, task_id, TaskStatus.BLOCKED)
+    cycle = runtime.run_cycle(step.session).cycle
+
+    formatter = CycleMemoryFormatter()
+    cycle_memory = formatter.cycle_memory(cycle, snapshot=runtime.session_snapshot(step.session))
+    reflection_memory = formatter.reflection_memory(cycle.reflections[0])
+
+    assert cycle_memory.layer == "episodic"
+    assert cycle_memory.memory_type == "narrative"
+    assert reflection_memory.layer == "procedural"
+    assert reflection_memory.memory_type == "procedure"
+    assert reflection_memory.metadata["kind"] == "mythic_reflection"
 
 
 def test_cli_default_sqlite_store_and_events(tmp_path, capsys):
@@ -301,3 +354,20 @@ def test_plugin_failure_records_reflection(tmp_path):
     assert not step.result.ok
     reflections = runtime.list_reflections(session_id=session.id)
     assert reflections[0].kind == "plugin_failure"
+
+
+def test_plugin_failure_publishes_reflection_when_bridge_configured(tmp_path):
+    plugin = tmp_path / "failing"
+    write_failing_plugin(plugin)
+    bridge = RecordingBridge()
+    runtime = MythicRuntime(
+        store=SQLiteRuntimeStore(tmp_path / "runtime"),
+        memory_bridge=bridge,
+    )
+    session = runtime.start_session("plugin bridge reflection").session
+
+    step = runtime.run_plugin(str(plugin), input_text="bad", session_id=session.id)
+
+    assert not step.result.ok
+    assert bridge.reflections[0].kind == "plugin_failure"
+    assert step.events[-1].type == "bridge_publish_completed"

@@ -21,6 +21,7 @@ This repo is at the first runnable runtime layer:
 - reflective records for blocked/failed tasks and plugin failures
 - resumable session snapshots
 - supervised plugin runner with manifest-based capability discovery
+- optional bridge that publishes cycle summaries and reflections into Engram
 - optional Engram integration via `mythic[engram]`
 
 ## install
@@ -64,6 +65,19 @@ SESSION_ID=...
 mythic task add "$SESSION_ID" "wire planner memory"
 mythic task ready "$SESSION_ID"
 ```
+
+Cycles can publish durable memory back into Engram:
+
+```bash
+mythic session cycle "$SESSION_ID" \
+  --publish \
+  --bridge engram \
+  --bridge-engram-config /path/to/engram/config.yaml
+```
+
+Cycle summaries are written as episodic narrative memories. Reflections are
+written as procedural memories with `metadata.kind = mythic_reflection`, because
+Engram does not currently expose a separate reflective layer.
 
 Plugins are manifest-driven and run under basic supervision:
 
