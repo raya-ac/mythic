@@ -92,6 +92,20 @@ class PluginResult:
         }
 
 
+@dataclass(frozen=True)
+class RegisteredPlugin:
+    """A discovered plugin manifest plus its directory."""
+
+    path: Path
+    manifest: PluginManifest
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "manifest": self.manifest.to_dict(),
+        }
+
+
 class PluginHost:
     """Loads plugin manifests and runs them with basic supervision."""
 
@@ -139,6 +153,51 @@ class PluginHost:
                 elapsed_ms=elapsed_ms,
                 timed_out=True,
             )
+
+    def discover(self, root: str | Path) -> list[RegisteredPlugin]:
+        path = Path(root)
+        if not path.exists():
+            return []
+        candidates: list[Path] = []
+        if path.is_file():
+            candidates.append(path)
+        else:
+            for name in MANIFEST_NAMES:
+                candidates.extend(path.rglob(name))
+
+        seen: set[Path] = set()
+        plugins: list[RegisteredPlugin] = []
+        for manifest_path in sorted(candidates):
+            resolved = manifest_path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            manifest = self.load_manifest(manifest_path)
+            plugins.append(RegisteredPlugin(path=manifest_path.parent, manifest=manifest))
+        return plugins
+
+    def find_by_capability(self, root: str | Path, capability: str) -> RegisteredPlugin | None:
+        for plugin in self.discover(root):
+            if capability in plugin.manifest.capabilities:
+                return plugin
+        return None
+
+    def run_capability(
+        self,
+        root: str | Path,
+        capability: str,
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> PluginResult:
+        plugin = self.find_by_capability(root, capability)
+        if plugin is None:
+            raise LookupError(f"no plugin found for capability: {capability}")
+        return self.run(
+            plugin.path,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _find_manifest(self, plugin_path: Path) -> Path:
         if plugin_path.is_file():

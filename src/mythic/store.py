@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Protocol
 
+from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.events import CognitionEvent
 from mythic.session import CognitiveSession
 
@@ -33,6 +34,24 @@ class RuntimeStore(Protocol):
         session_id: str | None = None,
     ) -> list[CognitionEvent]: ...
 
+    def save_cycle(self, cycle: CognitiveCycle) -> None: ...
+
+    def list_cycles(
+        self,
+        *,
+        limit: int = 20,
+        session_id: str | None = None,
+    ) -> list[CognitiveCycle]: ...
+
+    def save_reflection(self, reflection: ReflectionRecord) -> None: ...
+
+    def list_reflections(
+        self,
+        *,
+        limit: int = 20,
+        session_id: str | None = None,
+    ) -> list[ReflectionRecord]: ...
+
 
 class JsonRuntimeStore:
     """Small transparent persistence backend for debugging runtime state."""
@@ -41,6 +60,8 @@ class JsonRuntimeStore:
         self.root = Path(root)
         self.sessions_dir = self.root / "sessions"
         self.events_path = self.root / "events.jsonl"
+        self.cycles_path = self.root / "cycles.jsonl"
+        self.reflections_path = self.root / "reflections.jsonl"
 
     def init(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +111,56 @@ class JsonRuntimeStore:
             events = events[-limit:]
         return events
 
+    def save_cycle(self, cycle: CognitiveCycle) -> None:
+        self.init()
+        with self.cycles_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(cycle.to_dict(), sort_keys=True) + "\n")
+
+    def list_cycles(
+        self,
+        *,
+        limit: int = 20,
+        session_id: str | None = None,
+    ) -> list[CognitiveCycle]:
+        self.init()
+        if not self.cycles_path.exists():
+            return []
+        cycles = [
+            CognitiveCycle.from_dict(json.loads(line))
+            for line in self.cycles_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if session_id is not None:
+            cycles = [cycle for cycle in cycles if cycle.session_id == session_id]
+        if limit > 0:
+            cycles = cycles[-limit:]
+        return cycles
+
+    def save_reflection(self, reflection: ReflectionRecord) -> None:
+        self.init()
+        with self.reflections_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(reflection.to_dict(), sort_keys=True) + "\n")
+
+    def list_reflections(
+        self,
+        *,
+        limit: int = 20,
+        session_id: str | None = None,
+    ) -> list[ReflectionRecord]:
+        self.init()
+        if not self.reflections_path.exists():
+            return []
+        reflections = [
+            ReflectionRecord.from_dict(json.loads(line))
+            for line in self.reflections_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if session_id is not None:
+            reflections = [reflection for reflection in reflections if reflection.session_id == session_id]
+        if limit > 0:
+            reflections = reflections[-limit:]
+        return reflections
+
 
 class SQLiteRuntimeStore:
     """SQLite-backed local-first persistence for sessions and cognition events."""
@@ -138,6 +209,31 @@ class SQLiteRuntimeStore:
                 ON events(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_events_session
                 ON events(session_id, timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS cycles (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                completed_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cycles_session
+                ON cycles(session_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS reflections (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                cycle_id TEXT,
+                kind TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reflections_session
+                ON reflections(session_id, created_at DESC);
             """
         )
         self.conn.commit()
@@ -242,6 +338,134 @@ class SQLiteRuntimeStore:
                 session_id=row["session_id"],
                 timestamp=row["timestamp"],
                 data=json.loads(row["data"]),
+            )
+            for row in rows
+        ]
+
+    def save_cycle(self, cycle: CognitiveCycle) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO cycles
+            (id, session_id, status, payload, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cycle.id,
+                cycle.session_id,
+                cycle.status,
+                json.dumps(cycle.to_dict(), sort_keys=True),
+                cycle.created_at,
+                cycle.completed_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_cycles(
+        self,
+        *,
+        limit: int = 20,
+        session_id: str | None = None,
+    ) -> list[CognitiveCycle]:
+        self.init()
+        params: list[object] = []
+        where = ""
+        if session_id is not None:
+            where = "WHERE session_id = ?"
+            params.append(session_id)
+
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT payload FROM cycles
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            rows = list(reversed(rows))
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT payload FROM cycles
+                {where}
+                ORDER BY created_at ASC
+                """,
+                params,
+            ).fetchall()
+
+        return [CognitiveCycle.from_dict(json.loads(row["payload"])) for row in rows]
+
+    def save_reflection(self, reflection: ReflectionRecord) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO reflections
+            (id, session_id, cycle_id, kind, severity, subject, detail, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                reflection.id,
+                reflection.session_id,
+                reflection.cycle_id,
+                reflection.kind,
+                reflection.severity,
+                reflection.subject,
+                reflection.detail,
+                json.dumps(reflection.metadata, sort_keys=True),
+                reflection.created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_reflections(
+        self,
+        *,
+        limit: int = 20,
+        session_id: str | None = None,
+    ) -> list[ReflectionRecord]:
+        self.init()
+        params: list[object] = []
+        where = ""
+        if session_id is not None:
+            where = "WHERE session_id = ?"
+            params.append(session_id)
+
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM reflections
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            rows = list(reversed(rows))
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM reflections
+                {where}
+                ORDER BY created_at ASC
+                """,
+                params,
+            ).fetchall()
+
+        return [
+            ReflectionRecord(
+                id=row["id"],
+                session_id=row["session_id"],
+                cycle_id=row["cycle_id"],
+                kind=row["kind"],
+                severity=row["severity"],
+                subject=row["subject"],
+                detail=row["detail"],
+                metadata=json.loads(row["metadata"]),
+                created_at=row["created_at"],
             )
             for row in rows
         ]

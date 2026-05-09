@@ -56,12 +56,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_activate.add_argument("--engram", action="store_true", help="Use Engram for memory activation")
     p_activate.add_argument("--engram-config", help="Path to Engram config.yaml")
 
+    p_cycle = session_sub.add_parser("cycle", parents=[store_parent], help="Run one cognitive cycle")
+    p_cycle.add_argument("session_id")
+    p_cycle.add_argument("-k", "--top-k", type=int, default=5)
+    p_cycle.add_argument("--engram", action="store_true", help="Use Engram for memory activation")
+    p_cycle.add_argument("--engram-config", help="Path to Engram config.yaml")
+
     p_checkpoint = session_sub.add_parser("checkpoint", parents=[store_parent], help="Checkpoint a session")
     p_checkpoint.add_argument("session_id")
     p_checkpoint.add_argument("note")
 
     p_show = session_sub.add_parser("show", parents=[store_parent], help="Show one session")
     p_show.add_argument("session_id")
+
+    p_snapshot = session_sub.add_parser("snapshot", parents=[store_parent], help="Show a resumable session snapshot")
+    p_snapshot.add_argument("session_id")
+    p_snapshot.add_argument("--limit", type=int, default=10)
 
     session_sub.add_parser("list", parents=[store_parent], help="List sessions")
 
@@ -87,13 +97,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_events_list.add_argument("--session-id")
     p_events_list.add_argument("--limit", type=int, default=50)
 
+    p_cycles = sub.add_parser("cycles", parents=[store_parent], help="Inspect cognitive cycles")
+    cycles_sub = p_cycles.add_subparsers(dest="cycles_command")
+    p_cycles_list = cycles_sub.add_parser("list", parents=[store_parent], help="List recent cognitive cycles")
+    p_cycles_list.add_argument("--session-id")
+    p_cycles_list.add_argument("--limit", type=int, default=20)
+
+    p_reflections = sub.add_parser("reflections", parents=[store_parent], help="Inspect reflective records")
+    reflections_sub = p_reflections.add_subparsers(dest="reflections_command")
+    p_reflections_list = reflections_sub.add_parser("list", parents=[store_parent], help="List recent reflections")
+    p_reflections_list.add_argument("--session-id")
+    p_reflections_list.add_argument("--limit", type=int, default=20)
+
     p_plugin = sub.add_parser("plugin", parents=[store_parent], help="Run supervised plugins")
     plugin_sub = p_plugin.add_subparsers(dest="plugin_command")
+    p_plugin_list = plugin_sub.add_parser("list", parents=[store_parent], help="Discover plugins under a root")
+    p_plugin_list.add_argument("root")
+
     p_plugin_run = plugin_sub.add_parser("run", parents=[store_parent], help="Run a plugin manifest or directory")
     p_plugin_run.add_argument("path")
     p_plugin_run.add_argument("--input", dest="input_text")
     p_plugin_run.add_argument("--timeout", type=float)
     p_plugin_run.add_argument("--session-id")
+
+    p_plugin_cap = plugin_sub.add_parser("run-capability", parents=[store_parent], help="Run the first plugin matching a capability")
+    p_plugin_cap.add_argument("root")
+    p_plugin_cap.add_argument("capability")
+    p_plugin_cap.add_argument("--input", dest="input_text")
+    p_plugin_cap.add_argument("--timeout", type=float)
+    p_plugin_cap.add_argument("--session-id")
 
     args = parser.parse_args(argv)
 
@@ -121,6 +153,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps([event.to_dict() for event in step.events], indent=2, sort_keys=True))
         return 0
 
+    if args.command == "session" and args.session_command == "cycle":
+        session = runtime.resume_session(args.session_id)
+        step = runtime.run_cycle(session, top_k=args.top_k)
+        print(json.dumps(step.cycle.to_dict(), indent=2, sort_keys=True))
+        return 0
+
     if args.command == "session" and args.session_command == "checkpoint":
         session = runtime.resume_session(args.session_id)
         step = runtime.checkpoint(session, args.note)
@@ -130,6 +168,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "session" and args.session_command == "show":
         session = runtime.resume_session(args.session_id)
         print(json.dumps(session.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "session" and args.session_command == "snapshot":
+        session = runtime.resume_session(args.session_id)
+        print(json.dumps(runtime.session_snapshot(session, limit=args.limit), indent=2, sort_keys=True))
         return 0
 
     if args.command == "session" and args.session_command == "list":
@@ -158,9 +201,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps([event.to_dict() for event in events], indent=2, sort_keys=True))
         return 0
 
+    if args.command == "cycles" and args.cycles_command == "list":
+        cycles = runtime.list_cycles(limit=args.limit, session_id=args.session_id)
+        print(json.dumps([cycle.to_dict() for cycle in cycles], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "reflections" and args.reflections_command == "list":
+        reflections = runtime.list_reflections(limit=args.limit, session_id=args.session_id)
+        print(json.dumps([reflection.to_dict() for reflection in reflections], indent=2, sort_keys=True))
+        return 0
+
     if args.command == "plugin" and args.plugin_command == "run":
         step = runtime.run_plugin(
             args.path,
+            input_text=args.input_text,
+            timeout_seconds=args.timeout,
+            session_id=args.session_id,
+        )
+        print(json.dumps(step.result.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "plugin" and args.plugin_command == "list":
+        print(json.dumps(runtime.discover_plugins(args.root), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "plugin" and args.plugin_command == "run-capability":
+        step = runtime.run_capability(
+            args.root,
+            args.capability,
             input_text=args.input_text,
             timeout_seconds=args.timeout,
             session_id=args.session_id,
