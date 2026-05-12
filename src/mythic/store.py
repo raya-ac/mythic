@@ -14,6 +14,7 @@ from mythic.execution import ExecutionCheckpoint, ExecutionStatus, RuntimeExecut
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, merge_mesh_edge
 from mythic.reinforcement import ActivationFeedback, ReinforcementState
 from mythic.session import CognitiveSession
+from mythic.streams import StreamCheckpoint, filter_replay_events, normalize_event_types
 
 
 class RuntimeStore(Protocol):
@@ -37,6 +38,23 @@ class RuntimeStore(Protocol):
         limit: int = 50,
         session_id: str | None = None,
     ) -> list[CognitionEvent]: ...
+
+    def replay_events(
+        self,
+        *,
+        limit: int = 100,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+        after_event_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> list[CognitionEvent]: ...
+
+    def save_stream_checkpoint(self, checkpoint: StreamCheckpoint) -> None: ...
+
+    def load_stream_checkpoint(self, name: str) -> StreamCheckpoint: ...
+
+    def list_stream_checkpoints(self, *, limit: int = 20) -> list[StreamCheckpoint]: ...
 
     def save_cycle(self, cycle: CognitiveCycle) -> None: ...
 
@@ -143,6 +161,7 @@ class JsonRuntimeStore:
         self.drift_reports_path = self.root / "drift_reports.jsonl"
         self.executions_path = self.root / "executions.json"
         self.execution_checkpoints_path = self.root / "execution_checkpoints.jsonl"
+        self.stream_checkpoints_path = self.root / "stream_checkpoints.json"
 
     def init(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -172,6 +191,15 @@ class JsonRuntimeStore:
         with self.events_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
 
+    def _all_events(self) -> list[CognitionEvent]:
+        if not self.events_path.exists():
+            return []
+        return [
+            CognitionEvent.from_dict(json.loads(line))
+            for line in self.events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def list_events(
         self,
         *,
@@ -179,18 +207,65 @@ class JsonRuntimeStore:
         session_id: str | None = None,
     ) -> list[CognitionEvent]:
         self.init()
-        if not self.events_path.exists():
-            return []
-        events = [
-            CognitionEvent.from_dict(json.loads(line))
-            for line in self.events_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        events = self._all_events()
         if session_id is not None:
             events = [event for event in events if event.session_id == session_id]
         if limit > 0:
             events = events[-limit:]
         return events
+
+    def replay_events(
+        self,
+        *,
+        limit: int = 100,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+        after_event_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> list[CognitionEvent]:
+        self.init()
+        return filter_replay_events(
+            self._all_events(),
+            limit=limit,
+            session_id=session_id,
+            event_types=event_types,
+            after_event_id=after_event_id,
+            since=since,
+            until=until,
+        )
+
+    def _stream_checkpoints_payload(self) -> dict[str, dict]:
+        if not self.stream_checkpoints_path.exists():
+            return {}
+        return json.loads(self.stream_checkpoints_path.read_text(encoding="utf-8"))
+
+    def save_stream_checkpoint(self, checkpoint: StreamCheckpoint) -> None:
+        self.init()
+        payload = self._stream_checkpoints_payload()
+        payload[checkpoint.name] = checkpoint.to_dict()
+        self.stream_checkpoints_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def load_stream_checkpoint(self, name: str) -> StreamCheckpoint:
+        self.init()
+        data = self._stream_checkpoints_payload().get(name)
+        if data is None:
+            raise FileNotFoundError(f"stream checkpoint not found: {name}")
+        return StreamCheckpoint.from_dict(data)
+
+    def list_stream_checkpoints(self, *, limit: int = 20) -> list[StreamCheckpoint]:
+        self.init()
+        checkpoints = [
+            StreamCheckpoint.from_dict(item)
+            for item in self._stream_checkpoints_payload().values()
+        ]
+        checkpoints = sorted(checkpoints, key=lambda checkpoint: checkpoint.updated_at, reverse=True)
+        if limit > 0:
+            checkpoints = checkpoints[:limit]
+        return checkpoints
 
     def save_cycle(self, cycle: CognitiveCycle) -> None:
         self.init()
@@ -544,6 +619,18 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_events_session
                 ON events(session_id, timestamp DESC);
 
+            CREATE TABLE IF NOT EXISTS stream_checkpoints (
+                name TEXT PRIMARY KEY,
+                last_event_id TEXT,
+                filters TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stream_checkpoints_updated
+                ON stream_checkpoints(updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS cycles (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -786,6 +873,132 @@ class SQLiteRuntimeStore:
             )
             for row in rows
         ]
+
+    def replay_events(
+        self,
+        *,
+        limit: int = 100,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+        after_event_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> list[CognitionEvent]:
+        self.init()
+        params: list[object] = []
+        filters: list[str] = []
+        if after_event_id is not None:
+            row = self.conn.execute(
+                "SELECT rowid FROM events WHERE event_id = ?",
+                (after_event_id,),
+            ).fetchone()
+            if row is not None:
+                filters.append("rowid > ?")
+                params.append(row["rowid"])
+        if session_id is not None:
+            filters.append("session_id = ?")
+            params.append(session_id)
+        normalized_types = normalize_event_types(event_types)
+        if normalized_types is not None:
+            placeholders = ", ".join("?" for _ in normalized_types)
+            filters.append(f"type IN ({placeholders})")
+            params.extend(normalized_types)
+        if since is not None:
+            filters.append("timestamp >= ?")
+            params.append(since)
+        if until is not None:
+            filters.append("timestamp <= ?")
+            params.append(until)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM events
+                {where}
+                ORDER BY rowid ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM events
+                {where}
+                ORDER BY rowid ASC
+                """,
+                params,
+            ).fetchall()
+        return [
+            CognitionEvent(
+                event_id=row["event_id"],
+                type=row["type"],
+                session_id=row["session_id"],
+                timestamp=row["timestamp"],
+                data=json.loads(row["data"]),
+            )
+            for row in rows
+        ]
+
+    def save_stream_checkpoint(self, checkpoint: StreamCheckpoint) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT INTO stream_checkpoints
+            (name, last_event_id, filters, event_count, payload, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                last_event_id = excluded.last_event_id,
+                filters = excluded.filters,
+                event_count = excluded.event_count,
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (
+                checkpoint.name,
+                checkpoint.last_event_id,
+                json.dumps(checkpoint.filters, sort_keys=True),
+                checkpoint.event_count,
+                json.dumps(checkpoint.to_dict(), sort_keys=True),
+                checkpoint.created_at,
+                checkpoint.updated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def load_stream_checkpoint(self, name: str) -> StreamCheckpoint:
+        self.init()
+        row = self.conn.execute(
+            "SELECT payload FROM stream_checkpoints WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"stream checkpoint not found: {name}")
+        return StreamCheckpoint.from_dict(json.loads(row["payload"]))
+
+    def list_stream_checkpoints(self, *, limit: int = 20) -> list[StreamCheckpoint]:
+        self.init()
+        params: list[object] = []
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                """
+                SELECT payload FROM stream_checkpoints
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT payload FROM stream_checkpoints
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        return [StreamCheckpoint.from_dict(json.loads(row["payload"])) for row in rows]
 
     def save_cycle(self, cycle: CognitiveCycle) -> None:
         self.init()

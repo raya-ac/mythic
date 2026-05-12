@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from mythic.bridge import BridgePublishResult, MemoryBridge, NullMemoryBridge
@@ -24,6 +25,13 @@ from mythic.plugins import PluginHost, PluginResult
 from mythic.reinforcement import ActivationFeedback, ActivationOutcome, ReinforcementState, apply_feedback, decay_state
 from mythic.session import CognitiveSession
 from mythic.store import RuntimeStore, SQLiteRuntimeStore
+from mythic.streams import (
+    EventReplay,
+    EventStreamSummary,
+    StreamCheckpoint,
+    normalize_event_types,
+    stream_filters,
+)
 
 
 @dataclass
@@ -101,6 +109,15 @@ class ExecutionCheckpointStep:
     execution: RuntimeExecution
     checkpoint: ExecutionCheckpoint
     events: list[CognitionEvent]
+
+
+@dataclass
+class StreamCheckpointStep:
+    """Result of checkpointing an event stream."""
+
+    checkpoint: StreamCheckpoint
+    replay: EventReplay
+    event: CognitionEvent
 
 
 class MythicRuntime:
@@ -1034,6 +1051,166 @@ class MythicRuntime:
     ) -> list[CognitionEvent]:
         return self.store.list_events(limit=limit, session_id=session_id)
 
+    def subscribe_events(
+        self,
+        callback: Callable[[CognitionEvent], None],
+        *,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+    ) -> Callable[[], None]:
+        normalized_types = normalize_event_types(event_types)
+        allowed_types = set(normalized_types) if normalized_types is not None else None
+
+        def filtered_callback(event: CognitionEvent) -> None:
+            if session_id is not None and event.session_id != session_id:
+                return
+            if allowed_types is not None and event.type not in allowed_types:
+                return
+            callback(event)
+
+        return self.event_bus.subscribe(filtered_callback)
+
+    def replay_events(
+        self,
+        *,
+        limit: int = 100,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+        after_event_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> EventReplay:
+        filters = stream_filters(
+            session_id=session_id,
+            event_types=event_types,
+            since=since,
+            until=until,
+        )
+        return EventReplay(
+            events=self.store.replay_events(
+                limit=limit,
+                session_id=session_id,
+                event_types=event_types,
+                after_event_id=after_event_id,
+                since=since,
+                until=until,
+            ),
+            filters=filters,
+            after_event_id=after_event_id,
+        )
+
+    def event_summary(
+        self,
+        *,
+        limit: int = 0,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+        after_event_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> EventStreamSummary:
+        replay = self.replay_events(
+            limit=limit,
+            session_id=session_id,
+            event_types=event_types,
+            after_event_id=after_event_id,
+            since=since,
+            until=until,
+        )
+        return EventStreamSummary.from_events(replay.events, filters=replay.filters)
+
+    def checkpoint_event_stream(
+        self,
+        name: str,
+        *,
+        limit: int = 100,
+        session_id: str | None = None,
+        event_types: list[str] | str | None = None,
+        last_event_id: str | None = None,
+        after_event_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> StreamCheckpointStep:
+        filters = stream_filters(
+            session_id=session_id,
+            event_types=event_types,
+            since=since,
+            until=until,
+        )
+        replay = EventReplay(events=[], filters=filters)
+        event_count = 0
+        if last_event_id is None:
+            replay = self.replay_events(
+                limit=limit,
+                session_id=session_id,
+                event_types=event_types,
+                after_event_id=after_event_id,
+                since=since,
+                until=until,
+            )
+            last_event_id = replay.next_after_event_id
+            event_count = len(replay.events)
+
+        try:
+            existing = self.store.load_stream_checkpoint(name)
+            created_at = existing.created_at
+            event_count += existing.event_count
+        except FileNotFoundError:
+            created_at = time.time()
+
+        checkpoint = StreamCheckpoint(
+            name=name,
+            last_event_id=last_event_id,
+            filters=filters,
+            event_count=event_count,
+            created_at=created_at,
+            updated_at=time.time(),
+        )
+        self.store.save_stream_checkpoint(checkpoint)
+        event = self._emit(
+            "event_stream_checkpointed",
+            {"checkpoint": checkpoint.to_dict()},
+            session_id=session_id,
+        )
+        return StreamCheckpointStep(checkpoint=checkpoint, replay=replay, event=event)
+
+    def resume_event_stream(
+        self,
+        name: str,
+        *,
+        limit: int = 100,
+        advance: bool = False,
+    ) -> EventReplay:
+        checkpoint = self.store.load_stream_checkpoint(name)
+        filters = checkpoint.filters
+        replay = self.replay_events(
+            limit=limit,
+            session_id=filters.get("session_id"),
+            event_types=filters.get("event_types"),
+            after_event_id=checkpoint.last_event_id,
+            since=filters.get("since"),
+            until=filters.get("until"),
+        )
+        if advance and replay.next_after_event_id != checkpoint.last_event_id:
+            updated = StreamCheckpoint(
+                name=checkpoint.name,
+                last_event_id=replay.next_after_event_id,
+                filters=checkpoint.filters,
+                event_count=checkpoint.event_count + len(replay.events),
+                created_at=checkpoint.created_at,
+                updated_at=time.time(),
+            )
+            self.store.save_stream_checkpoint(updated)
+            self._emit(
+                "event_stream_checkpointed",
+                {"checkpoint": updated.to_dict(), "advanced": True},
+                session_id=filters.get("session_id"),
+            )
+        return replay
+
+    def list_stream_checkpoints(self, *, limit: int = 20) -> list[StreamCheckpoint]:
+        return self.store.list_stream_checkpoints(limit=limit)
+
     def list_cycles(
         self,
         *,
@@ -1109,6 +1286,7 @@ class MythicRuntime:
                 event.to_dict()
                 for event in self.list_events(session_id=session.id, limit=limit)
             ],
+            "event_stream": self.event_summary(session_id=session.id, limit=limit).to_dict(),
             "memory_mesh": self.traverse_mesh(session.id, kind="session", depth=2, limit=limit).to_dict(),
             "latest_drift_report": (
                 reports[0].to_dict()

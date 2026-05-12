@@ -16,6 +16,7 @@ This repo is at the first runnable runtime layer:
 - SQLite runtime store for durable session and event state
 - optional JSON runtime store for transparent local debugging
 - event bus for structured cognition events with persisted event logs
+- replayable cognition streams with filters, summaries, and named checkpoints
 - cognitive cycles that combine planner state, memory activation, and reflection
 - planner-aware memory activation request model
 - memory mesh graph for sessions, goals, tasks, cycles, activations, and manual links
@@ -50,7 +51,7 @@ mythic session start "build a persistent cognition runtime for engram"
 mythic session list
 mythic session cycle "$SESSION_ID"
 mythic session snapshot "$SESSION_ID"
-mythic events list
+mythic events replay --session-id "$SESSION_ID"
 ```
 
 Session and event state is stored in `.mythic/runtime.db` by default.
@@ -61,6 +62,25 @@ Use JSON files instead when you want easily inspected local state:
 mythic init --backend json
 mythic session start "inspectable runtime state" --backend json
 ```
+
+Event streams make cognition observable and replayable:
+
+```bash
+mythic events replay \
+  --session-id "$SESSION_ID" \
+  --type memory_activation \
+  --format jsonl
+mythic events summary --session-id "$SESSION_ID"
+mythic events checkpoint session-stream \
+  --session-id "$SESSION_ID" \
+  --type memory_activation
+mythic events resume session-stream --advance
+mythic events checkpoints
+```
+
+Replay is ordered from the persisted event log and supports session, event type,
+timestamp, and event-id cursor filters. Named checkpoints store stream cursors so
+agents and tools can consume only the cognition events they have not seen yet.
 
 Planner tasks are part of session state:
 

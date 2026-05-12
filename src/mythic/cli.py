@@ -42,6 +42,23 @@ def _runtime(args: argparse.Namespace) -> MythicRuntime:
     )
 
 
+def _add_event_filter_args(command: argparse.ArgumentParser, *, default_limit: int = 100) -> None:
+    command.add_argument("--session-id")
+    command.add_argument("--type", dest="event_types", action="append", help="Filter by event type")
+    command.add_argument("--after-event-id")
+    command.add_argument("--since", type=float, help="Only include events at or after this timestamp")
+    command.add_argument("--until", type=float, help="Only include events at or before this timestamp")
+    command.add_argument("--limit", type=int, default=default_limit)
+
+
+def _print_event_replay(replay, output_format: str) -> None:
+    if output_format == "jsonl":
+        for event in replay.events:
+            print(json.dumps(event.to_dict(), sort_keys=True))
+        return
+    print(json.dumps(replay.to_dict(), indent=2, sort_keys=True))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     store_parent = argparse.ArgumentParser(add_help=False)
     store_parent.add_argument("--store", default=argparse.SUPPRESS, help="Runtime store directory")
@@ -129,6 +146,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_events_list = events_sub.add_parser("list", parents=[store_parent], help="List recent events")
     p_events_list.add_argument("--session-id")
     p_events_list.add_argument("--limit", type=int, default=50)
+    p_events_replay = events_sub.add_parser("replay", parents=[store_parent], help="Replay cognition events from a cursor")
+    _add_event_filter_args(p_events_replay)
+    p_events_replay.add_argument("--format", choices=["json", "jsonl"], default="json")
+    p_events_summary = events_sub.add_parser("summary", parents=[store_parent], help="Summarize cognition events")
+    _add_event_filter_args(p_events_summary, default_limit=0)
+    p_events_checkpoint = events_sub.add_parser("checkpoint", parents=[store_parent], help="Save a named event stream cursor")
+    p_events_checkpoint.add_argument("name")
+    _add_event_filter_args(p_events_checkpoint)
+    p_events_checkpoint.add_argument("--last-event-id")
+    p_events_checkpoints = events_sub.add_parser("checkpoints", parents=[store_parent], help="List event stream checkpoints")
+    p_events_checkpoints.add_argument("--limit", type=int, default=20)
+    p_events_resume = events_sub.add_parser("resume", parents=[store_parent], help="Replay events after a named checkpoint")
+    p_events_resume.add_argument("name")
+    p_events_resume.add_argument("--limit", type=int, default=100)
+    p_events_resume.add_argument("--advance", action="store_true", help="Move the checkpoint to the replay tail")
+    p_events_resume.add_argument("--format", choices=["json", "jsonl"], default="json")
 
     p_cycles = sub.add_parser("cycles", parents=[store_parent], help="Inspect cognitive cycles")
     cycles_sub = p_cycles.add_subparsers(dest="cycles_command")
@@ -341,6 +374,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "events" and args.events_command == "list":
         events = runtime.list_events(limit=args.limit, session_id=args.session_id)
         print(json.dumps([event.to_dict() for event in events], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "events" and args.events_command == "replay":
+        replay = runtime.replay_events(
+            limit=args.limit,
+            session_id=args.session_id,
+            event_types=args.event_types,
+            after_event_id=args.after_event_id,
+            since=args.since,
+            until=args.until,
+        )
+        _print_event_replay(replay, args.format)
+        return 0
+
+    if args.command == "events" and args.events_command == "summary":
+        summary = runtime.event_summary(
+            limit=args.limit,
+            session_id=args.session_id,
+            event_types=args.event_types,
+            after_event_id=args.after_event_id,
+            since=args.since,
+            until=args.until,
+        )
+        print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "events" and args.events_command == "checkpoint":
+        step = runtime.checkpoint_event_stream(
+            args.name,
+            limit=args.limit,
+            session_id=args.session_id,
+            event_types=args.event_types,
+            last_event_id=args.last_event_id,
+            after_event_id=args.after_event_id,
+            since=args.since,
+            until=args.until,
+        )
+        print(
+            json.dumps(
+                {
+                    "checkpoint": step.checkpoint.to_dict(),
+                    "replay": step.replay.to_dict(),
+                    "event": step.event.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "events" and args.events_command == "checkpoints":
+        checkpoints = runtime.list_stream_checkpoints(limit=args.limit)
+        print(json.dumps([checkpoint.to_dict() for checkpoint in checkpoints], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "events" and args.events_command == "resume":
+        replay = runtime.resume_event_stream(args.name, limit=args.limit, advance=args.advance)
+        _print_event_replay(replay, args.format)
         return 0
 
     if args.command == "cycles" and args.cycles_command == "list":

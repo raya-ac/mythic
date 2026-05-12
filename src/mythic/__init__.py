@@ -11,6 +11,7 @@ from mythic.plugins import PluginHost, PluginManifest, PluginResult, RegisteredP
 from mythic.reinforcement import ActivationFeedback, ActivationOutcome, ReinforcementState
 from mythic.runtime import MythicRuntime
 from mythic.session import CognitiveSession
+from mythic.streams import EventReplay, EventStreamSummary, StreamCheckpoint
 
 __all__ = [
     "ActivationFeedback",
@@ -26,6 +27,8 @@ __all__ = [
     "DriftSeverity",
     "EngramMemoryBridge",
     "EventBus",
+    "EventReplay",
+    "EventStreamSummary",
     "ExecutionCheckpoint",
     "ExecutionStatus",
     "MemoryActivation",
@@ -41,6 +44,7 @@ __all__ = [
     "ReinforcementState",
     "RegisteredPlugin",
     "RuntimeExecution",
+    "StreamCheckpoint",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

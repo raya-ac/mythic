@@ -1,7 +1,9 @@
+import asyncio
 import json
 import sys
 
 from mythic.bridge import BridgePublishResult, CycleMemoryFormatter
+from mythic.events import EventBus
 from mythic.memory import MemoryActivation
 from mythic.cli import main
 from mythic.mesh import MemoryMeshEdge, mesh_node_id
@@ -107,6 +109,95 @@ def test_sqlite_store_persists_events(tmp_path):
         "session_started",
         "session_checkpoint",
     ]
+
+
+def test_runtime_replays_summarizes_and_checkpoints_stream(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("observe cognition").session
+
+    runtime.checkpoint(session, "first stream point")
+    runtime.add_task(session, "stream planner event")
+
+    replay = runtime.replay_events(
+        session_id=session.id,
+        event_types=["session_checkpoint", "planner_task_added"],
+        limit=10,
+    )
+    summary = runtime.event_summary(session_id=session.id, limit=0)
+    checkpoint = runtime.checkpoint_event_stream(
+        "session-stream",
+        session_id=session.id,
+        event_types=["session_checkpoint", "planner_task_added"],
+    ).checkpoint
+
+    assert [event.type for event in replay.events] == [
+        "session_checkpoint",
+        "planner_task_added",
+    ]
+    assert summary.event_counts["session_started"] == 1
+    assert summary.event_counts["session_checkpoint"] == 1
+    assert checkpoint.last_event_id == replay.next_after_event_id
+    assert checkpoint.filters["session_id"] == session.id
+
+    runtime.checkpoint(session, "second stream point")
+    resumed = runtime.resume_event_stream("session-stream", advance=True)
+    updated_checkpoint = runtime.store.load_stream_checkpoint("session-stream")
+
+    assert [event.type for event in resumed.events] == ["session_checkpoint"]
+    assert updated_checkpoint.last_event_id == resumed.next_after_event_id
+
+
+def test_json_store_replays_events_after_cursor(tmp_path):
+    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    session = runtime.start_session("json stream").session
+    first = runtime.checkpoint(session, "first").events[0]
+    second = runtime.checkpoint(session, "second").events[0]
+
+    replay = runtime.replay_events(
+        session_id=session.id,
+        event_types="session_checkpoint",
+        after_event_id=first.event_id,
+    )
+
+    assert [event.event_id for event in replay.events] == [second.event_id]
+
+
+def test_event_subscription_filters(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("subscribe").session
+    captured = []
+
+    unsubscribe = runtime.subscribe_events(
+        captured.append,
+        session_id=session.id,
+        event_types="session_checkpoint",
+    )
+    runtime.checkpoint(session, "visible")
+    runtime.start_session("other session")
+    unsubscribe()
+    runtime.checkpoint(session, "hidden after unsubscribe")
+
+    assert [event.type for event in captured] == ["session_checkpoint"]
+    assert captured[0].data == {"note": "visible"}
+
+
+def test_event_bus_async_stream_filters():
+    async def collect_one():
+        bus = EventBus()
+        stream = bus.stream(session_id="s1", event_types="target")
+        task = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        bus.emit("ignored", {}, session_id="s1")
+        bus.emit("target", {"ok": True}, session_id="s2")
+        bus.emit("target", {"ok": True}, session_id="s1")
+        event = await task
+        await stream.aclose()
+        return event
+
+    event = asyncio.run(collect_one())
+
+    assert event.type == "target"
+    assert event.session_id == "s1"
 
 
 def test_planner_tasks_round_trip(tmp_path):
@@ -702,6 +793,60 @@ def test_cli_default_sqlite_store_and_events(tmp_path, capsys):
     assert main(["events", "list", "--store", str(store), "--session-id", session["id"]]) == 0
     events = json.loads(capsys.readouterr().out)
     assert events[0]["type"] == "session_started"
+
+
+def test_cli_event_stream_commands(tmp_path, capsys):
+    store = tmp_path / "runtime"
+
+    assert main(["session", "start", "cli event stream", "--store", str(store)]) == 0
+    session = json.loads(capsys.readouterr().out)
+    assert main(["session", "checkpoint", session["id"], "first", "--store", str(store)]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "events",
+        "replay",
+        "--store",
+        str(store),
+        "--session-id",
+        session["id"],
+        "--type",
+        "session_checkpoint",
+        "--format",
+        "jsonl",
+    ]) == 0
+    replay_lines = capsys.readouterr().out.strip().splitlines()
+    assert len(replay_lines) == 1
+    assert json.loads(replay_lines[0])["type"] == "session_checkpoint"
+
+    assert main(["events", "summary", "--store", str(store), "--session-id", session["id"]]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["event_counts"]["session_started"] == 1
+
+    assert main([
+        "events",
+        "checkpoint",
+        "cli-stream",
+        "--store",
+        str(store),
+        "--session-id",
+        session["id"],
+        "--type",
+        "session_checkpoint",
+    ]) == 0
+    checkpoint = json.loads(capsys.readouterr().out)["checkpoint"]
+    assert checkpoint["name"] == "cli-stream"
+
+    assert main(["session", "checkpoint", session["id"], "second", "--store", str(store)]) == 0
+    capsys.readouterr()
+
+    assert main(["events", "resume", "cli-stream", "--store", str(store), "--advance"]) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert [event["type"] for event in resumed["events"]] == ["session_checkpoint"]
+
+    assert main(["events", "checkpoints", "--store", str(store)]) == 0
+    checkpoints = json.loads(capsys.readouterr().out)
+    assert checkpoints[0]["name"] == "cli-stream"
 
 
 def test_cli_cycle_and_snapshot(tmp_path, capsys):

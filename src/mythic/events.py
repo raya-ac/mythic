@@ -44,6 +44,14 @@ class CognitionEvent:
 EventCallback = Callable[[CognitionEvent], None]
 
 
+def _event_type_set(event_types: str | list[str] | None) -> set[str] | None:
+    if event_types is None:
+        return None
+    if isinstance(event_types, str):
+        return {event_types}
+    return {event_type for event_type in event_types if event_type}
+
+
 class EventBus:
     """In-process event bus with replayable recent history."""
 
@@ -91,12 +99,24 @@ class EventBus:
 
         return unsubscribe
 
-    async def stream(self, max_queue_size: int = 100) -> AsyncIterator[CognitionEvent]:
+    async def stream(
+        self,
+        max_queue_size: int = 100,
+        *,
+        session_id: str | None = None,
+        event_types: str | list[str] | None = None,
+    ) -> AsyncIterator[CognitionEvent]:
+        allowed_types = _event_type_set(event_types)
         queue: asyncio.Queue[CognitionEvent] = asyncio.Queue(maxsize=max_queue_size)
         self._queues.append(queue)
         try:
             while True:
-                yield await queue.get()
+                event = await queue.get()
+                if session_id is not None and event.session_id != session_id:
+                    continue
+                if allowed_types is not None and event.type not in allowed_types:
+                    continue
+                yield event
         finally:
             if queue in self._queues:
                 self._queues.remove(queue)
