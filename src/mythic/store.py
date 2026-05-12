@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from mythic.cycles import CognitiveCycle, ReflectionRecord
+from mythic.drift import DriftReport
 from mythic.events import CognitionEvent
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, merge_mesh_edge
 from mythic.reinforcement import ActivationFeedback, ReinforcementState
@@ -94,6 +95,15 @@ class RuntimeStore(Protocol):
         kind: str | None = None,
     ) -> list[MemoryMeshEdge]: ...
 
+    def save_drift_report(self, report: DriftReport) -> None: ...
+
+    def list_drift_reports(
+        self,
+        *,
+        limit: int = 20,
+        scope: str | None = None,
+    ) -> list[DriftReport]: ...
+
 
 class JsonRuntimeStore:
     """Small transparent persistence backend for debugging runtime state."""
@@ -108,6 +118,7 @@ class JsonRuntimeStore:
         self.reinforcement_path = self.root / "reinforcement.json"
         self.mesh_nodes_path = self.root / "mesh_nodes.json"
         self.mesh_edges_path = self.root / "mesh_edges.json"
+        self.drift_reports_path = self.root / "drift_reports.jsonl"
 
     def init(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +377,32 @@ class JsonRuntimeStore:
             edges = edges[:limit]
         return edges
 
+    def save_drift_report(self, report: DriftReport) -> None:
+        self.init()
+        with self.drift_reports_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(report.to_dict(), sort_keys=True) + "\n")
+
+    def list_drift_reports(
+        self,
+        *,
+        limit: int = 20,
+        scope: str | None = None,
+    ) -> list[DriftReport]:
+        self.init()
+        if not self.drift_reports_path.exists():
+            return []
+        reports = [
+            DriftReport.from_dict(json.loads(line))
+            for line in self.drift_reports_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if scope is not None:
+            reports = [report for report in reports if report.scope == scope]
+        reports = sorted(reports, key=lambda report: report.generated_at, reverse=True)
+        if limit > 0:
+            reports = reports[:limit]
+        return reports
+
 
 class SQLiteRuntimeStore:
     """SQLite-backed local-first persistence for sessions and cognition events."""
@@ -505,6 +542,19 @@ class SQLiteRuntimeStore:
                 ON mesh_edges(target_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_mesh_edges_kind
                 ON mesh_edges(kind, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS drift_reports (
+                id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                score REAL NOT NULL,
+                issue_count INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                generated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_drift_reports_scope
+                ON drift_reports(scope, generated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_drift_reports_generated
+                ON drift_reports(generated_at DESC);
             """
         )
         self.conn.commit()
@@ -1100,6 +1150,59 @@ class SQLiteRuntimeStore:
             )
             for row in rows
         ]
+
+    def save_drift_report(self, report: DriftReport) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO drift_reports
+            (id, scope, score, issue_count, payload, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report.id,
+                report.scope,
+                report.score,
+                len(report.issues),
+                json.dumps(report.to_dict(), sort_keys=True),
+                report.generated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_drift_reports(
+        self,
+        *,
+        limit: int = 20,
+        scope: str | None = None,
+    ) -> list[DriftReport]:
+        self.init()
+        params: list[object] = []
+        where = ""
+        if scope is not None:
+            where = "WHERE scope = ?"
+            params.append(scope)
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT payload FROM drift_reports
+                {where}
+                ORDER BY generated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT payload FROM drift_reports
+                {where}
+                ORDER BY generated_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [DriftReport.from_dict(json.loads(row["payload"])) for row in rows]
 
     def close(self) -> None:
         if self._conn is not None:

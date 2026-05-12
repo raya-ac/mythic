@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from mythic.bridge import BridgePublishResult, MemoryBridge, NullMemoryBridge
 from mythic.cycles import CognitiveCycle, ReflectionRecord
+from mythic.drift import DriftAnalyzer, DriftReport
 from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryActivationRequest, MemoryAdapter, NullMemoryAdapter
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, MeshTraversal, mesh_node_id
@@ -69,6 +70,14 @@ class MeshLinkStep:
     edge: MemoryMeshEdge
 
 
+@dataclass
+class DriftStep:
+    """Result of one drift inspection."""
+
+    report: DriftReport
+    event: CognitionEvent
+
+
 class MythicRuntime:
     """Coordinator for persistent cognitive sessions."""
 
@@ -80,12 +89,14 @@ class MythicRuntime:
         memory_bridge: MemoryBridge | None = None,
         event_bus: EventBus | None = None,
         plugin_host: PluginHost | None = None,
+        drift_analyzer: DriftAnalyzer | None = None,
     ):
         self.store = store or SQLiteRuntimeStore()
         self.memory_adapter = memory_adapter or NullMemoryAdapter()
         self.memory_bridge = memory_bridge or NullMemoryBridge()
         self.event_bus = event_bus or EventBus()
         self.plugin_host = plugin_host or PluginHost()
+        self.drift_analyzer = drift_analyzer or DriftAnalyzer()
 
     def init(self) -> None:
         self.store.init()
@@ -775,6 +786,41 @@ class MythicRuntime:
             ordered_edges = ordered_edges[:max_items]
         return MeshTraversal(root_id=root_id, depth=max_depth, nodes=ordered_nodes, edges=ordered_edges)
 
+    def inspect_drift(
+        self,
+        *,
+        session_id: str | None = None,
+        stale_after_seconds: float = 7 * 24 * 60 * 60,
+        persist: bool = True,
+    ) -> DriftStep:
+        report = self.drift_analyzer.analyze(
+            self.store,
+            session_id=session_id,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if persist:
+            self.store.save_drift_report(report)
+        event = self._emit(
+            "drift_inspection_completed",
+            {
+                "report_id": report.id,
+                "scope": report.scope,
+                "score": report.score,
+                "issue_count": len(report.issues),
+                "persisted": persist,
+            },
+            session_id=session_id,
+        )
+        return DriftStep(report=report, event=event)
+
+    def list_drift_reports(
+        self,
+        *,
+        limit: int = 20,
+        scope: str | None = None,
+    ) -> list[DriftReport]:
+        return self.store.list_drift_reports(limit=limit, scope=scope)
+
     def list_sessions(self) -> list[CognitiveSession]:
         return self.store.list_sessions()
 
@@ -862,12 +908,18 @@ class MythicRuntime:
                 for event in self.list_events(session_id=session.id, limit=limit)
             ],
             "memory_mesh": self.traverse_mesh(session.id, kind="session", depth=2, limit=limit).to_dict(),
+            "latest_drift_report": (
+                reports[0].to_dict()
+                if (reports := self.list_drift_reports(limit=1, scope=f"session:{session.id}"))
+                else None
+            ),
             "suggested_next_actions": suggestions[:limit],
         }
 
 __all__ = [
     "CycleStep",
     "DecayStep",
+    "DriftStep",
     "FeedbackStep",
     "MeshLinkStep",
     "MemoryActivation",

@@ -2,6 +2,7 @@
 
 from mythic.bridge import BridgeMemory, BridgePublishResult, CycleMemoryFormatter, EngramMemoryBridge
 from mythic.cycles import CognitiveCycle, ReflectionRecord
+from mythic.drift import DriftIssue, DriftReport, DriftSeverity
 from mythic.events import CognitionEvent, EventBus
 from mythic.memory import MemoryActivation, MemoryActivationRequest
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, MeshTraversal
@@ -19,6 +20,9 @@ __all__ = [
     "CognitiveCycle",
     "CognitionEvent",
     "CognitiveSession",
+    "DriftIssue",
+    "DriftReport",
+    "DriftSeverity",
     "EngramMemoryBridge",
     "EventBus",
     "MemoryActivation",
@@ -35,4 +39,4 @@ __all__ = [
     "RegisteredPlugin",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

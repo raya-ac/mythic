@@ -196,6 +196,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_mesh_traverse.add_argument("--depth", type=int, default=2)
     p_mesh_traverse.add_argument("--limit", type=int, default=50)
 
+    p_drift = sub.add_parser("drift", parents=[store_parent], help="Inspect runtime drift")
+    drift_sub = p_drift.add_subparsers(dest="drift_command")
+
+    p_drift_inspect = drift_sub.add_parser("inspect", parents=[store_parent], help="Run a drift inspection")
+    p_drift_inspect.add_argument("--session-id")
+    p_drift_inspect.add_argument("--stale-after-hours", type=float, default=24 * 7)
+    p_drift_inspect.add_argument("--no-save", action="store_true", help="Do not persist the drift report")
+
+    p_drift_reports = drift_sub.add_parser("reports", parents=[store_parent], help="List persisted drift reports")
+    p_drift_reports.add_argument("--scope")
+    p_drift_reports.add_argument("--limit", type=int, default=20)
+
     p_plugin = sub.add_parser("plugin", parents=[store_parent], help="Run supervised plugins")
     plugin_sub = p_plugin.add_subparsers(dest="plugin_command")
     p_plugin_list = plugin_sub.add_parser("list", parents=[store_parent], help="Discover plugins under a root")
@@ -403,6 +415,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
         )
         print(json.dumps(traversal.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "drift" and args.drift_command == "inspect":
+        step = runtime.inspect_drift(
+            session_id=args.session_id,
+            stale_after_seconds=args.stale_after_hours * 60 * 60,
+            persist=not args.no_save,
+        )
+        print(
+            json.dumps(
+                {
+                    "report": step.report.to_dict(),
+                    "event": step.event.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "drift" and args.drift_command == "reports":
+        reports = runtime.list_drift_reports(limit=args.limit, scope=args.scope)
+        print(json.dumps([report.to_dict() for report in reports], indent=2, sort_keys=True))
         return 0
 
     if args.command == "plugin" and args.plugin_command == "run":

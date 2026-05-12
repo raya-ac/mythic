@@ -20,6 +20,7 @@ This repo is at the first runnable runtime layer:
 - planner-aware memory activation request model
 - memory mesh graph for sessions, goals, tasks, cycles, activations, and manual links
 - adaptive memory reinforcement from activation feedback and decay
+- drift reports for planner, mesh, reinforcement, cycle, and stale workflow checks
 - reflective records for blocked/failed tasks and plugin failures
 - resumable session snapshots
 - supervised plugin runner with manifest-based capability discovery
@@ -115,6 +116,19 @@ reinforcement feedback, and plugin runs are linked automatically as the runtime
 executes. Manual links let agents add causal, temporal, or project-specific
 relationships that Engram can later use for multi-hop continuity.
 
+Drift inspections check runtime consistency and persist reports:
+
+```bash
+mythic drift inspect --session-id "$SESSION_ID"
+mythic drift inspect --stale-after-hours 24
+mythic drift reports --scope "session:$SESSION_ID"
+```
+
+The first drift pass detects blocked or failed planner tasks, missing planner
+dependencies, stale active sessions, dangling mesh edges, missing mesh nodes for
+persisted runtime records, contradicted/stale reinforced memories, and cycles
+that are no longer linked from their sessions.
+
 Plugins are manifest-driven and run under basic supervision:
 
 ```bash
@@ -150,6 +164,7 @@ foundation model
       -> memory mesh
       -> plugin host
       -> reflection records
+      -> drift reports
       -> event stream
       -> runtime store
           -> sqlite / json / engram

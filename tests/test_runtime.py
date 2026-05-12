@@ -4,7 +4,7 @@ import sys
 from mythic.bridge import BridgePublishResult, CycleMemoryFormatter
 from mythic.memory import MemoryActivation
 from mythic.cli import main
-from mythic.mesh import mesh_node_id
+from mythic.mesh import MemoryMeshEdge, mesh_node_id
 from mythic.planner import TaskStatus
 from mythic.plugins import PluginHost
 from mythic.runtime import MythicRuntime
@@ -409,6 +409,105 @@ def test_cli_reinforcement_commands(tmp_path, capsys):
     assert main(["reinforcement", "decay", "--store", str(store), "--rate", "0.5"]) == 0
     decay = json.loads(capsys.readouterr().out)
     assert decay["count"] == 1
+
+
+def test_drift_inspection_detects_planner_mesh_and_reinforcement_issues(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("detect drift").session
+    task_step = runtime.add_task(session, "blocked on missing dependency", depends_on=["missing-task"])
+    task_id = next(
+        task.id
+        for task in task_step.session.planner.tasks.values()
+        if task.title == "blocked on missing dependency"
+    )
+    runtime.set_task_status(task_step.session, task_id, TaskStatus.BLOCKED)
+    runtime.record_feedback(
+        session_id=session.id,
+        memory_id="mem_drift",
+        outcome="contradicted",
+        note="the memory disagreed with current state",
+    )
+    runtime.store.save_mesh_edge(
+        MemoryMeshEdge(
+            source_id="memory:missing-source",
+            target_id="memory:missing-target",
+            kind="claims",
+        )
+    )
+
+    step = runtime.inspect_drift(session_id=session.id)
+    issue_kinds = {issue.kind for issue in step.report.issues}
+
+    assert step.event.type == "drift_inspection_completed"
+    assert step.report.scope == f"session:{session.id}"
+    assert step.report.score < 100
+    assert "planner_missing_dependency" in issue_kinds
+    assert "blocked_task" in issue_kinds
+    assert "contradicted_memory" in issue_kinds
+    assert "mesh_dangling_source" in issue_kinds
+    assert "mesh_dangling_target" in issue_kinds
+    assert runtime.list_drift_reports(scope=f"session:{session.id}")[0].id == step.report.id
+
+
+def test_drift_report_persists_in_json_store(tmp_path):
+    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    session = runtime.start_session("json drift").session
+    old_updated_at = session.updated_at
+    session.updated_at = old_updated_at - (8 * 24 * 60 * 60)
+    runtime.store.save_session(session)
+
+    report = runtime.inspect_drift(
+        session_id=session.id,
+        stale_after_seconds=7 * 24 * 60 * 60,
+    ).report
+    reloaded = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    reports = reloaded.list_drift_reports(scope=f"session:{session.id}")
+
+    assert reports[0].id == report.id
+    assert any(issue.kind == "stale_session" for issue in reports[0].issues)
+
+
+def test_drift_no_save_does_not_persist_report(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+
+    step = runtime.inspect_drift(persist=False)
+
+    assert step.report.scope == "runtime"
+    assert runtime.list_drift_reports() == []
+
+
+def test_cli_drift_commands(tmp_path, capsys):
+    store = tmp_path / "runtime"
+
+    assert main(["session", "start", "cli drift smoke", "--store", str(store)]) == 0
+    session = json.loads(capsys.readouterr().out)
+
+    assert main([
+        "reinforcement",
+        "feedback",
+        session["id"],
+        "mem_1",
+        "stale",
+        "--store",
+        str(store),
+    ]) == 0
+    capsys.readouterr()
+
+    assert main(["drift", "inspect", "--store", str(store), "--session-id", session["id"]]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["report"]["scope"] == f"session:{session['id']}"
+    assert any(issue["kind"] == "stale_memory" for issue in result["report"]["issues"])
+
+    assert main([
+        "drift",
+        "reports",
+        "--store",
+        str(store),
+        "--scope",
+        f"session:{session['id']}",
+    ]) == 0
+    reports = json.loads(capsys.readouterr().out)
+    assert reports[0]["id"] == result["report"]["id"]
 
 
 def test_cycle_memory_formatter_maps_reflections_to_procedural_memory(tmp_path):
