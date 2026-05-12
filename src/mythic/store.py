@@ -10,6 +10,7 @@ from typing import Protocol
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.drift import DriftReport
 from mythic.events import CognitionEvent
+from mythic.execution import ExecutionCheckpoint, ExecutionStatus, RuntimeExecution
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, merge_mesh_edge
 from mythic.reinforcement import ActivationFeedback, ReinforcementState
 from mythic.session import CognitiveSession
@@ -104,6 +105,27 @@ class RuntimeStore(Protocol):
         scope: str | None = None,
     ) -> list[DriftReport]: ...
 
+    def save_execution(self, execution: RuntimeExecution) -> None: ...
+
+    def load_execution(self, execution_id: str) -> RuntimeExecution: ...
+
+    def list_executions(
+        self,
+        *,
+        limit: int = 50,
+        session_id: str | None = None,
+        status: ExecutionStatus | str | None = None,
+    ) -> list[RuntimeExecution]: ...
+
+    def save_execution_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None: ...
+
+    def list_execution_checkpoints(
+        self,
+        *,
+        execution_id: str,
+        limit: int = 20,
+    ) -> list[ExecutionCheckpoint]: ...
+
 
 class JsonRuntimeStore:
     """Small transparent persistence backend for debugging runtime state."""
@@ -119,6 +141,8 @@ class JsonRuntimeStore:
         self.mesh_nodes_path = self.root / "mesh_nodes.json"
         self.mesh_edges_path = self.root / "mesh_edges.json"
         self.drift_reports_path = self.root / "drift_reports.jsonl"
+        self.executions_path = self.root / "executions.json"
+        self.execution_checkpoints_path = self.root / "execution_checkpoints.jsonl"
 
     def init(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -403,6 +427,74 @@ class JsonRuntimeStore:
             reports = reports[:limit]
         return reports
 
+    def _executions_payload(self) -> dict[str, dict]:
+        if not self.executions_path.exists():
+            return {}
+        return json.loads(self.executions_path.read_text(encoding="utf-8"))
+
+    def save_execution(self, execution: RuntimeExecution) -> None:
+        self.init()
+        payload = self._executions_payload()
+        payload[execution.id] = execution.to_dict()
+        self.executions_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def load_execution(self, execution_id: str) -> RuntimeExecution:
+        self.init()
+        data = self._executions_payload().get(execution_id)
+        if data is None:
+            raise FileNotFoundError(f"execution not found: {execution_id}")
+        return RuntimeExecution.from_dict(data)
+
+    def list_executions(
+        self,
+        *,
+        limit: int = 50,
+        session_id: str | None = None,
+        status: ExecutionStatus | str | None = None,
+    ) -> list[RuntimeExecution]:
+        self.init()
+        executions = [
+            RuntimeExecution.from_dict(item)
+            for item in self._executions_payload().values()
+        ]
+        if session_id is not None:
+            executions = [execution for execution in executions if execution.session_id == session_id]
+        if status is not None:
+            parsed_status = ExecutionStatus(status)
+            executions = [execution for execution in executions if execution.status == parsed_status]
+        executions = sorted(executions, key=lambda execution: execution.updated_at, reverse=True)
+        if limit > 0:
+            executions = executions[:limit]
+        return executions
+
+    def save_execution_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
+        self.init()
+        with self.execution_checkpoints_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(checkpoint.to_dict(), sort_keys=True) + "\n")
+
+    def list_execution_checkpoints(
+        self,
+        *,
+        execution_id: str,
+        limit: int = 20,
+    ) -> list[ExecutionCheckpoint]:
+        self.init()
+        if not self.execution_checkpoints_path.exists():
+            return []
+        checkpoints = [
+            ExecutionCheckpoint.from_dict(json.loads(line))
+            for line in self.execution_checkpoints_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint.execution_id == execution_id]
+        checkpoints = sorted(checkpoints, key=lambda checkpoint: checkpoint.created_at, reverse=True)
+        if limit > 0:
+            checkpoints = checkpoints[:limit]
+        return checkpoints
+
 
 class SQLiteRuntimeStore:
     """SQLite-backed local-first persistence for sessions and cognition events."""
@@ -555,6 +647,38 @@ class SQLiteRuntimeStore:
                 ON drift_reports(scope, generated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_drift_reports_generated
                 ON drift_reports(generated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS executions (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                parent_id TEXT,
+                relation TEXT,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                completed_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_executions_session
+                ON executions(session_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_executions_status
+                ON executions(status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_executions_parent
+                ON executions(parent_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS execution_checkpoints (
+                id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                note TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_execution_checkpoints_execution
+                ON execution_checkpoints(execution_id, created_at DESC);
             """
         )
         self.conn.commit()
@@ -1203,6 +1327,143 @@ class SQLiteRuntimeStore:
                 params,
             ).fetchall()
         return [DriftReport.from_dict(json.loads(row["payload"])) for row in rows]
+
+    def save_execution(self, execution: RuntimeExecution) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT INTO executions
+            (id, session_id, kind, goal, status, attempt, parent_id, relation, payload,
+             created_at, updated_at, started_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                session_id = excluded.session_id,
+                kind = excluded.kind,
+                goal = excluded.goal,
+                status = excluded.status,
+                attempt = excluded.attempt,
+                parent_id = excluded.parent_id,
+                relation = excluded.relation,
+                payload = excluded.payload,
+                updated_at = excluded.updated_at,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at
+            """,
+            (
+                execution.id,
+                execution.session_id,
+                execution.kind,
+                execution.goal,
+                execution.status.value,
+                execution.attempt,
+                execution.parent_id,
+                execution.relation,
+                json.dumps(execution.to_dict(), sort_keys=True),
+                execution.created_at,
+                execution.updated_at,
+                execution.started_at,
+                execution.completed_at,
+            ),
+        )
+        self.conn.commit()
+
+    def load_execution(self, execution_id: str) -> RuntimeExecution:
+        self.init()
+        row = self.conn.execute(
+            "SELECT payload FROM executions WHERE id = ?",
+            (execution_id,),
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"execution not found: {execution_id}")
+        return RuntimeExecution.from_dict(json.loads(row["payload"]))
+
+    def list_executions(
+        self,
+        *,
+        limit: int = 50,
+        session_id: str | None = None,
+        status: ExecutionStatus | str | None = None,
+    ) -> list[RuntimeExecution]:
+        self.init()
+        params: list[object] = []
+        filters: list[str] = []
+        if session_id is not None:
+            filters.append("session_id = ?")
+            params.append(session_id)
+        if status is not None:
+            filters.append("status = ?")
+            params.append(ExecutionStatus(status).value)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                f"""
+                SELECT payload FROM executions
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"""
+                SELECT payload FROM executions
+                {where}
+                ORDER BY updated_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [RuntimeExecution.from_dict(json.loads(row["payload"])) for row in rows]
+
+    def save_execution_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
+        self.init()
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO execution_checkpoints
+            (id, execution_id, note, payload, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                checkpoint.id,
+                checkpoint.execution_id,
+                checkpoint.note,
+                json.dumps(checkpoint.to_dict(), sort_keys=True),
+                checkpoint.created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_execution_checkpoints(
+        self,
+        *,
+        execution_id: str,
+        limit: int = 20,
+    ) -> list[ExecutionCheckpoint]:
+        self.init()
+        params: list[object] = [execution_id]
+        if limit > 0:
+            params.append(limit)
+            rows = self.conn.execute(
+                """
+                SELECT payload FROM execution_checkpoints
+                WHERE execution_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT payload FROM execution_checkpoints
+                WHERE execution_id = ?
+                ORDER BY created_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [ExecutionCheckpoint.from_dict(json.loads(row["payload"])) for row in rows]
 
     def close(self) -> None:
         if self._conn is not None:

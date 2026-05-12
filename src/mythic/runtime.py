@@ -9,6 +9,14 @@ from mythic.bridge import BridgePublishResult, MemoryBridge, NullMemoryBridge
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.drift import DriftAnalyzer, DriftReport
 from mythic.events import CognitionEvent, EventBus
+from mythic.execution import (
+    ExecutionCheckpoint,
+    ExecutionStatus,
+    RuntimeExecution,
+    branch_execution as make_branch_execution,
+    retry_execution as make_retry_execution,
+    transition_execution,
+)
 from mythic.memory import MemoryActivation, MemoryActivationRequest, MemoryAdapter, NullMemoryAdapter
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, MeshTraversal, mesh_node_id
 from mythic.planner import TaskNode, TaskStatus
@@ -76,6 +84,23 @@ class DriftStep:
 
     report: DriftReport
     event: CognitionEvent
+
+
+@dataclass
+class ExecutionStep:
+    """Result of changing an execution record."""
+
+    execution: RuntimeExecution
+    events: list[CognitionEvent]
+
+
+@dataclass
+class ExecutionCheckpointStep:
+    """Result of checkpointing an execution."""
+
+    execution: RuntimeExecution
+    checkpoint: ExecutionCheckpoint
+    events: list[CognitionEvent]
 
 
 class MythicRuntime:
@@ -220,6 +245,29 @@ class MythicRuntime:
                 reflection_node.id,
                 "produced_reflection",
                 metadata={"kind": reflection.kind, "severity": reflection.severity},
+            )
+
+    def _record_execution_mesh(self, execution: RuntimeExecution) -> None:
+        session_node = self._mesh_node("session", execution.session_id, label=execution.session_id)
+        execution_node = self._mesh_node(
+            "execution",
+            execution.id,
+            label=execution.goal,
+            metadata=execution.to_dict(),
+        )
+        self._mesh_edge(
+            session_node.id,
+            execution_node.id,
+            "has_execution",
+            metadata={"kind": execution.kind, "status": execution.status.value},
+        )
+        if execution.parent_id is not None:
+            parent_node = self._mesh_node("execution", execution.parent_id, label=execution.parent_id)
+            self._mesh_edge(
+                parent_node.id,
+                execution_node.id,
+                execution.relation or "continued_as",
+                metadata={"attempt": execution.attempt},
             )
 
     def start_session(self, goal: str) -> RuntimeStep:
@@ -821,6 +869,160 @@ class MythicRuntime:
     ) -> list[DriftReport]:
         return self.store.list_drift_reports(limit=limit, scope=scope)
 
+    def start_execution(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        goal: str,
+        payload: dict | None = None,
+    ) -> ExecutionStep:
+        timestamp = time.time()
+        execution = RuntimeExecution(
+            session_id=session_id,
+            kind=kind,
+            goal=goal,
+            status=ExecutionStatus.RUNNING,
+            payload=payload or {},
+            created_at=timestamp,
+            updated_at=timestamp,
+            started_at=timestamp,
+        )
+        self.store.save_execution(execution)
+        self._record_execution_mesh(execution)
+        event = self._emit(
+            "execution_started",
+            {"execution": execution.to_dict()},
+            session_id=session_id,
+        )
+        return ExecutionStep(execution=execution, events=[event])
+
+    def set_execution_status(
+        self,
+        execution_id: str,
+        status: ExecutionStatus | str,
+        *,
+        payload: dict | None = None,
+        result: dict | None = None,
+        error: str | None = None,
+    ) -> ExecutionStep:
+        previous = self.store.load_execution(execution_id)
+        execution = transition_execution(
+            previous,
+            status,
+            payload=payload,
+            result=result,
+            error=error,
+        )
+        self.store.save_execution(execution)
+        self._record_execution_mesh(execution)
+        event = self._emit(
+            "execution_status_changed",
+            {
+                "execution_id": execution.id,
+                "previous_status": previous.status.value,
+                "status": execution.status.value,
+                "execution": execution.to_dict(),
+            },
+            session_id=execution.session_id,
+        )
+        return ExecutionStep(execution=execution, events=[event])
+
+    def checkpoint_execution(
+        self,
+        execution_id: str,
+        note: str,
+        *,
+        payload: dict | None = None,
+    ) -> ExecutionCheckpointStep:
+        execution = self.store.load_execution(execution_id)
+        checkpoint = ExecutionCheckpoint(
+            execution_id=execution.id,
+            note=note,
+            payload=payload or {},
+        )
+        self.store.save_execution_checkpoint(checkpoint)
+        checkpoint_node = self._mesh_node(
+            "execution_checkpoint",
+            checkpoint.id,
+            label=checkpoint.note,
+            metadata=checkpoint.to_dict(),
+        )
+        execution_node = self._mesh_node("execution", execution.id, label=execution.goal)
+        self._mesh_edge(
+            execution_node.id,
+            checkpoint_node.id,
+            "checkpointed",
+            metadata={"note": checkpoint.note},
+        )
+        event = self._emit(
+            "execution_checkpointed",
+            {
+                "execution_id": execution.id,
+                "checkpoint": checkpoint.to_dict(),
+            },
+            session_id=execution.session_id,
+        )
+        return ExecutionCheckpointStep(execution=execution, checkpoint=checkpoint, events=[event])
+
+    def retry_execution(
+        self,
+        execution_id: str,
+        *,
+        payload: dict | None = None,
+    ) -> ExecutionStep:
+        previous = self.store.load_execution(execution_id)
+        execution = make_retry_execution(previous, payload=payload)
+        self.store.save_execution(execution)
+        self._record_execution_mesh(execution)
+        event = self._emit(
+            "execution_retried",
+            {
+                "previous_execution_id": previous.id,
+                "execution": execution.to_dict(),
+            },
+            session_id=execution.session_id,
+        )
+        return ExecutionStep(execution=execution, events=[event])
+
+    def branch_execution(
+        self,
+        execution_id: str,
+        *,
+        goal: str | None = None,
+        payload: dict | None = None,
+    ) -> ExecutionStep:
+        previous = self.store.load_execution(execution_id)
+        execution = make_branch_execution(previous, goal=goal, payload=payload)
+        self.store.save_execution(execution)
+        self._record_execution_mesh(execution)
+        event = self._emit(
+            "execution_branched",
+            {
+                "previous_execution_id": previous.id,
+                "execution": execution.to_dict(),
+            },
+            session_id=execution.session_id,
+        )
+        return ExecutionStep(execution=execution, events=[event])
+
+    def list_executions(
+        self,
+        *,
+        limit: int = 50,
+        session_id: str | None = None,
+        status: ExecutionStatus | str | None = None,
+    ) -> list[RuntimeExecution]:
+        return self.store.list_executions(limit=limit, session_id=session_id, status=status)
+
+    def list_execution_checkpoints(
+        self,
+        execution_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[ExecutionCheckpoint]:
+        return self.store.list_execution_checkpoints(execution_id=execution_id, limit=limit)
+
     def list_sessions(self) -> list[CognitiveSession]:
         return self.store.list_sessions()
 
@@ -913,6 +1115,10 @@ class MythicRuntime:
                 if (reports := self.list_drift_reports(limit=1, scope=f"session:{session.id}"))
                 else None
             ),
+            "recent_executions": [
+                execution.to_dict()
+                for execution in self.list_executions(session_id=session.id, limit=limit)
+            ],
             "suggested_next_actions": suggestions[:limit],
         }
 
@@ -920,6 +1126,10 @@ __all__ = [
     "CycleStep",
     "DecayStep",
     "DriftStep",
+    "ExecutionCheckpoint",
+    "ExecutionCheckpointStep",
+    "ExecutionStatus",
+    "ExecutionStep",
     "FeedbackStep",
     "MeshLinkStep",
     "MemoryActivation",
@@ -928,5 +1138,6 @@ __all__ = [
     "MeshTraversal",
     "MythicRuntime",
     "PluginRunStep",
+    "RuntimeExecution",
     "RuntimeStep",
 ]

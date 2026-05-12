@@ -21,6 +21,7 @@ This repo is at the first runnable runtime layer:
 - memory mesh graph for sessions, goals, tasks, cycles, activations, and manual links
 - adaptive memory reinforcement from activation feedback and decay
 - drift reports for planner, mesh, reinforcement, cycle, and stale workflow checks
+- recoverable execution records with pause, resume, retry, checkpoint, and branch semantics
 - reflective records for blocked/failed tasks and plugin failures
 - resumable session snapshots
 - supervised plugin runner with manifest-based capability discovery
@@ -129,6 +130,22 @@ dependencies, stale active sessions, dangling mesh edges, missing mesh nodes for
 persisted runtime records, contradicted/stale reinforced memories, and cycles
 that are no longer linked from their sessions.
 
+Recoverable executions persist long-running work:
+
+```bash
+mythic execution start "$SESSION_ID" workflow "index project memory" \
+  --payload '{"root":"/repo"}'
+mythic execution checkpoint "$EXECUTION_ID" "parsed source files"
+mythic execution status "$EXECUTION_ID" paused
+mythic execution status "$EXECUTION_ID" running
+mythic execution retry "$EXECUTION_ID"
+mythic execution branch "$EXECUTION_ID" --goal "try alternate parser"
+mythic execution list --session-id "$SESSION_ID"
+```
+
+Executions are linked into the memory mesh, appear in session snapshots, and are
+included in drift checks when failed, paused, or stale.
+
 Plugins are manifest-driven and run under basic supervision:
 
 ```bash
@@ -165,6 +182,7 @@ foundation model
       -> plugin host
       -> reflection records
       -> drift reports
+      -> recoverable executions
       -> event stream
       -> runtime store
           -> sqlite / json / engram
@@ -178,6 +196,7 @@ The long-term target is persistent cognition rather than passive recall:
 - memory mesh traversal
 - adaptive reinforcement
 - plugin-capable supervised runtimes
+- recoverable execution orchestration
 - realtime cognition streams
 - drift and contradiction checks
 

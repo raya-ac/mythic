@@ -510,6 +510,166 @@ def test_cli_drift_commands(tmp_path, capsys):
     assert reports[0]["id"] == result["report"]["id"]
 
 
+def test_execution_runtime_transitions_checkpoint_and_mesh(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("recover work").session
+
+    started = runtime.start_execution(
+        session_id=session.id,
+        kind="cycle",
+        goal="run recoverable cycle",
+        payload={"step": 1},
+    )
+    paused = runtime.set_execution_status(started.execution.id, "paused")
+    resumed = runtime.set_execution_status(paused.execution.id, "running")
+    checkpoint = runtime.checkpoint_execution(
+        resumed.execution.id,
+        "after activation",
+        payload={"activation_count": 2},
+    )
+    completed = runtime.set_execution_status(
+        resumed.execution.id,
+        "completed",
+        result={"ok": True},
+    )
+    snapshot = runtime.session_snapshot(session)
+    edge_kinds = {edge.kind for edge in runtime.list_mesh_edges(source_id=f"session:{session.id}", limit=0)}
+
+    assert started.execution.status.value == "running"
+    assert paused.execution.status.value == "paused"
+    assert resumed.execution.started_at == started.execution.started_at
+    assert checkpoint.checkpoint.note == "after activation"
+    assert completed.execution.result == {"ok": True}
+    assert completed.execution.completed_at is not None
+    assert runtime.list_execution_checkpoints(started.execution.id)[0].id == checkpoint.checkpoint.id
+    assert snapshot["recent_executions"][0]["id"] == started.execution.id
+    assert "has_execution" in edge_kinds
+
+
+def test_execution_retry_and_branch_persist(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("retry work").session
+    original = runtime.start_execution(
+        session_id=session.id,
+        kind="plugin",
+        goal="run plugin",
+        payload={"input": "one"},
+    ).execution
+    failed = runtime.set_execution_status(original.id, "failed", error="boom").execution
+
+    retry = runtime.retry_execution(failed.id, payload={"input": "two"}).execution
+    branch = runtime.branch_execution(failed.id, goal="try alternate plugin").execution
+    reloaded = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    executions = reloaded.list_executions(session_id=session.id, limit=0)
+    edge_kinds = {edge.kind for edge in reloaded.list_mesh_edges(limit=0)}
+
+    assert retry.parent_id == failed.id
+    assert retry.relation == "retry"
+    assert retry.attempt == 2
+    assert retry.status.value == "running"
+    assert branch.parent_id == failed.id
+    assert branch.relation == "branch"
+    assert branch.status.value == "pending"
+    assert {execution.id for execution in executions} == {failed.id, retry.id, branch.id}
+    assert {"retry", "branch"} <= edge_kinds
+
+
+def test_json_store_persists_executions_and_checkpoints(tmp_path):
+    runtime = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    session = runtime.start_session("json execution").session
+    execution = runtime.start_execution(
+        session_id=session.id,
+        kind="workflow",
+        goal="persist execution",
+    ).execution
+    runtime.checkpoint_execution(execution.id, "json checkpoint")
+
+    reloaded = MythicRuntime(store=JsonRuntimeStore(tmp_path))
+    loaded = reloaded.list_executions(session_id=session.id)[0]
+    checkpoint = reloaded.list_execution_checkpoints(execution.id)[0]
+
+    assert loaded.id == execution.id
+    assert loaded.status.value == "running"
+    assert checkpoint.note == "json checkpoint"
+
+
+def test_drift_reports_failed_execution(tmp_path):
+    runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
+    session = runtime.start_session("execution drift").session
+    execution = runtime.start_execution(
+        session_id=session.id,
+        kind="workflow",
+        goal="will fail",
+    ).execution
+    runtime.set_execution_status(execution.id, "failed", error="bad state")
+
+    report = runtime.inspect_drift(session_id=session.id).report
+
+    assert any(issue.kind == "failed_execution" for issue in report.issues)
+
+
+def test_cli_execution_commands(tmp_path, capsys):
+    store = tmp_path / "runtime"
+
+    assert main(["session", "start", "cli execution smoke", "--store", str(store)]) == 0
+    session = json.loads(capsys.readouterr().out)
+
+    assert main([
+        "execution",
+        "start",
+        session["id"],
+        "workflow",
+        "do work",
+        "--store",
+        str(store),
+        "--payload",
+        "{\"step\":1}",
+    ]) == 0
+    execution = json.loads(capsys.readouterr().out)
+    assert execution["status"] == "running"
+
+    assert main([
+        "execution",
+        "checkpoint",
+        execution["id"],
+        "midpoint",
+        "--store",
+        str(store),
+        "--payload",
+        "{\"done\":1}",
+    ]) == 0
+    checkpoint_result = json.loads(capsys.readouterr().out)
+    assert checkpoint_result["checkpoint"]["note"] == "midpoint"
+
+    assert main([
+        "execution",
+        "status",
+        execution["id"],
+        "paused",
+        "--store",
+        str(store),
+    ]) == 0
+    paused = json.loads(capsys.readouterr().out)
+    assert paused["status"] == "paused"
+
+    assert main(["execution", "retry", execution["id"], "--store", str(store)]) == 0
+    retry = json.loads(capsys.readouterr().out)
+    assert retry["parent_id"] == execution["id"]
+    assert retry["relation"] == "retry"
+
+    assert main(["execution", "branch", execution["id"], "--store", str(store), "--goal", "alternate"]) == 0
+    branch = json.loads(capsys.readouterr().out)
+    assert branch["status"] == "pending"
+
+    assert main(["execution", "list", "--store", str(store), "--session-id", session["id"]]) == 0
+    executions = json.loads(capsys.readouterr().out)
+    assert len(executions) == 3
+
+    assert main(["execution", "checkpoints", execution["id"], "--store", str(store)]) == 0
+    checkpoints = json.loads(capsys.readouterr().out)
+    assert checkpoints[0]["note"] == "midpoint"
+
+
 def test_cycle_memory_formatter_maps_reflections_to_procedural_memory(tmp_path):
     runtime = MythicRuntime(store=SQLiteRuntimeStore(tmp_path))
     session = runtime.start_session("format bridge memory").session

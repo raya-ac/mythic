@@ -4,6 +4,7 @@ from mythic.bridge import BridgeMemory, BridgePublishResult, CycleMemoryFormatte
 from mythic.cycles import CognitiveCycle, ReflectionRecord
 from mythic.drift import DriftIssue, DriftReport, DriftSeverity
 from mythic.events import CognitionEvent, EventBus
+from mythic.execution import ExecutionCheckpoint, ExecutionStatus, RuntimeExecution
 from mythic.memory import MemoryActivation, MemoryActivationRequest
 from mythic.mesh import MemoryMeshEdge, MemoryMeshNode, MeshTraversal
 from mythic.plugins import PluginHost, PluginManifest, PluginResult, RegisteredPlugin
@@ -25,6 +26,8 @@ __all__ = [
     "DriftSeverity",
     "EngramMemoryBridge",
     "EventBus",
+    "ExecutionCheckpoint",
+    "ExecutionStatus",
     "MemoryActivation",
     "MemoryActivationRequest",
     "MemoryMeshEdge",
@@ -37,6 +40,7 @@ __all__ = [
     "ReflectionRecord",
     "ReinforcementState",
     "RegisteredPlugin",
+    "RuntimeExecution",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

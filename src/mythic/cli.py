@@ -8,6 +8,7 @@ from typing import Sequence
 
 from mythic import __version__
 from mythic.bridge import EngramMemoryBridge, NullMemoryBridge
+from mythic.execution import ExecutionStatus
 from mythic.memory import EngramMemoryAdapter, NullMemoryAdapter
 from mythic.planner import TaskStatus
 from mythic.reinforcement import ActivationOutcome
@@ -207,6 +208,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_drift_reports = drift_sub.add_parser("reports", parents=[store_parent], help="List persisted drift reports")
     p_drift_reports.add_argument("--scope")
     p_drift_reports.add_argument("--limit", type=int, default=20)
+
+    p_execution = sub.add_parser("execution", parents=[store_parent], help="Manage recoverable executions")
+    execution_sub = p_execution.add_subparsers(dest="execution_command")
+
+    p_execution_start = execution_sub.add_parser("start", parents=[store_parent], help="Start a recoverable execution")
+    p_execution_start.add_argument("session_id")
+    p_execution_start.add_argument("kind")
+    p_execution_start.add_argument("goal")
+    p_execution_start.add_argument("--payload", type=_json_object)
+
+    p_execution_status = execution_sub.add_parser("status", parents=[store_parent], help="Set execution status")
+    p_execution_status.add_argument("execution_id")
+    p_execution_status.add_argument("status", choices=[status.value for status in ExecutionStatus])
+    p_execution_status.add_argument("--payload", type=_json_object)
+    p_execution_status.add_argument("--result", type=_json_object)
+    p_execution_status.add_argument("--error")
+
+    p_execution_checkpoint = execution_sub.add_parser("checkpoint", parents=[store_parent], help="Checkpoint an execution")
+    p_execution_checkpoint.add_argument("execution_id")
+    p_execution_checkpoint.add_argument("note")
+    p_execution_checkpoint.add_argument("--payload", type=_json_object)
+
+    p_execution_retry = execution_sub.add_parser("retry", parents=[store_parent], help="Retry an execution")
+    p_execution_retry.add_argument("execution_id")
+    p_execution_retry.add_argument("--payload", type=_json_object)
+
+    p_execution_branch = execution_sub.add_parser("branch", parents=[store_parent], help="Branch an execution")
+    p_execution_branch.add_argument("execution_id")
+    p_execution_branch.add_argument("--goal")
+    p_execution_branch.add_argument("--payload", type=_json_object)
+
+    p_execution_list = execution_sub.add_parser("list", parents=[store_parent], help="List executions")
+    p_execution_list.add_argument("--session-id")
+    p_execution_list.add_argument("--status", choices=[status.value for status in ExecutionStatus])
+    p_execution_list.add_argument("--limit", type=int, default=50)
+
+    p_execution_checkpoints = execution_sub.add_parser("checkpoints", parents=[store_parent], help="List execution checkpoints")
+    p_execution_checkpoints.add_argument("execution_id")
+    p_execution_checkpoints.add_argument("--limit", type=int, default=20)
 
     p_plugin = sub.add_parser("plugin", parents=[store_parent], help="Run supervised plugins")
     plugin_sub = p_plugin.add_subparsers(dest="plugin_command")
@@ -438,6 +478,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "drift" and args.drift_command == "reports":
         reports = runtime.list_drift_reports(limit=args.limit, scope=args.scope)
         print(json.dumps([report.to_dict() for report in reports], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "execution" and args.execution_command == "start":
+        step = runtime.start_execution(
+            session_id=args.session_id,
+            kind=args.kind,
+            goal=args.goal,
+            payload=args.payload,
+        )
+        print(json.dumps(step.execution.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "execution" and args.execution_command == "status":
+        step = runtime.set_execution_status(
+            args.execution_id,
+            args.status,
+            payload=args.payload,
+            result=args.result,
+            error=args.error,
+        )
+        print(json.dumps(step.execution.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "execution" and args.execution_command == "checkpoint":
+        step = runtime.checkpoint_execution(
+            args.execution_id,
+            args.note,
+            payload=args.payload,
+        )
+        print(
+            json.dumps(
+                {
+                    "execution": step.execution.to_dict(),
+                    "checkpoint": step.checkpoint.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execution" and args.execution_command == "retry":
+        step = runtime.retry_execution(args.execution_id, payload=args.payload)
+        print(json.dumps(step.execution.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "execution" and args.execution_command == "branch":
+        step = runtime.branch_execution(
+            args.execution_id,
+            goal=args.goal,
+            payload=args.payload,
+        )
+        print(json.dumps(step.execution.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "execution" and args.execution_command == "list":
+        executions = runtime.list_executions(
+            limit=args.limit,
+            session_id=args.session_id,
+            status=args.status,
+        )
+        print(json.dumps([execution.to_dict() for execution in executions], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "execution" and args.execution_command == "checkpoints":
+        checkpoints = runtime.list_execution_checkpoints(args.execution_id, limit=args.limit)
+        print(json.dumps([checkpoint.to_dict() for checkpoint in checkpoints], indent=2, sort_keys=True))
         return 0
 
     if args.command == "plugin" and args.plugin_command == "run":

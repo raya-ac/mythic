@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from mythic.execution import ExecutionStatus
 from mythic.mesh import mesh_node_id
 from mythic.planner import TaskStatus
 from mythic.reinforcement import ActivationOutcome
@@ -171,6 +172,7 @@ class DriftAnalyzer:
         issues.extend(self._mesh_issues(store, sessions))
         issues.extend(self._reinforcement_issues(store))
         issues.extend(self._cycle_issues(store, sessions))
+        issues.extend(self._execution_issues(store, sessions, timestamp, stale_after_seconds))
 
         scope = f"session:{session_id}" if session_id is not None else "runtime"
         return DriftReport.create(
@@ -233,6 +235,54 @@ class DriftAnalyzer:
                             subject=task.id,
                             detail="Planner task is failed and should be repaired or superseded.",
                             metadata={"session_id": session.id, "task": task.to_dict()},
+                        )
+                    )
+        return issues
+
+    def _execution_issues(
+        self,
+        store: Any,
+        sessions: list[Any],
+        now: float,
+        stale_after_seconds: float,
+    ) -> list[DriftIssue]:
+        if not hasattr(store, "list_executions"):
+            return []
+
+        issues: list[DriftIssue] = []
+        inspected_session_ids = {session.id for session in sessions}
+        for execution in store.list_executions(limit=0):
+            if inspected_session_ids and execution.session_id not in inspected_session_ids:
+                continue
+            if execution.status == ExecutionStatus.FAILED:
+                issues.append(
+                    DriftIssue.create(
+                        kind="failed_execution",
+                        severity=DriftSeverity.ERROR,
+                        subject=execution.id,
+                        detail="Execution failed and should be retried, branched, or superseded.",
+                        metadata={"execution": execution.to_dict()},
+                    )
+                )
+            elif execution.status == ExecutionStatus.PAUSED:
+                issues.append(
+                    DriftIssue.create(
+                        kind="paused_execution",
+                        severity=DriftSeverity.INFO,
+                        subject=execution.id,
+                        detail="Execution is paused and waiting to resume, branch, cancel, or complete.",
+                        metadata={"execution": execution.to_dict()},
+                    )
+                )
+            elif execution.status in {ExecutionStatus.RUNNING, ExecutionStatus.PENDING}:
+                if now - execution.updated_at > stale_after_seconds:
+                    issues.append(
+                        DriftIssue.create(
+                            kind="stale_execution",
+                            severity=DriftSeverity.WARNING,
+                            subject=execution.id,
+                            detail="Execution has not been updated within the stale workflow threshold.",
+                            metadata={"execution": execution.to_dict()},
                         )
                     )
         return issues
